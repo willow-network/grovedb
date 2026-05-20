@@ -44,7 +44,9 @@ use grovedb_path::SubtreePath;
 use grovedb_storage::{
     rocksdb_storage::PrefixedRocksDbTransactionContext, Storage, StorageBatch, StorageContext,
 };
-use grovedb_version::{check_grovedb_v0_with_cost, version::GroveVersion};
+use grovedb_version::{
+    check_grovedb_v0_or_v1_with_cost, check_grovedb_v0_with_cost, version::GroveVersion,
+};
 
 use crate::util::{compat, TxRef};
 #[cfg(feature = "minimal")]
@@ -722,13 +724,14 @@ impl GroveDb {
         batch: &StorageBatch,
         grove_version: &GroveVersion,
     ) -> CostResult<bool, Error> {
-        check_grovedb_v0_with_cost!(
+        let delete_internal_version = grove_version
+            .grovedb_versions
+            .operations
+            .delete
+            .delete_internal_on_transaction;
+        check_grovedb_v0_or_v1_with_cost!(
             "delete_internal_on_transaction",
-            grove_version
-                .grovedb_versions
-                .operations
-                .delete
-                .delete_internal_on_transaction
+            delete_internal_version
         );
 
         let mut cost = OperationCost::default();
@@ -746,7 +749,7 @@ impl GroveDb {
                 grove_version
             )
         );
-        let uses_sum_tree = subtree_to_delete_from.tree_type;
+        let parent_tree_type = subtree_to_delete_from.tree_type;
         if let Some(tree_type) = element.tree_type() {
             let subtree_merk_path = path.derive_owned_with_child(key);
             let subtree_merk_path_ref = SubtreePath::from(&subtree_merk_path);
@@ -838,55 +841,87 @@ impl GroveDb {
                         );
                     }
                 }
-                // todo: verify why we need to open the same? merk again
-                let storage = self
-                    .db
-                    .get_transactional_storage_context(path.clone(), Some(batch), transaction)
-                    .unwrap_add_cost(&mut cost);
+                if delete_internal_version == 0 {
+                    // Legacy behavior reopened the parent layer using the
+                    // child tree type before deleting the tree element.
+                    let storage = self
+                        .db
+                        .get_transactional_storage_context(path.clone(), Some(batch), transaction)
+                        .unwrap_add_cost(&mut cost);
 
-                let mut merk_to_delete_tree_from = cost_return_on_error!(
-                    &mut cost,
-                    Merk::open_layered_with_root_key(
-                        storage,
-                        subtree_to_delete_from.root_key(),
-                        tree_type,
-                        Some(&Element::value_defined_cost_for_serialized_value),
-                        grove_version,
-                    )
-                    .map_err(|e| {
-                        Error::CorruptedData(format!(
-                            "cannot open a subtree with given root key: {e}"
-                        ))
-                    })
-                );
-                // We are deleting a tree, a tree uses 3 bytes
-                cost_return_on_error_into!(
-                    &mut cost,
-                    Element::delete_with_sectioned_removal_bytes(
-                        &mut merk_to_delete_tree_from,
-                        key,
-                        Some(options.as_merk_options()),
-                        true,
-                        uses_sum_tree,
-                        sectioned_removal,
-                        grove_version,
-                    )
-                );
-                let mut merk_cache: HashMap<
-                    SubtreePath<B>,
-                    Merk<PrefixedRocksDbTransactionContext>,
-                > = HashMap::default();
-                merk_cache.insert(path.clone(), merk_to_delete_tree_from);
-                cost_return_on_error!(
-                    &mut cost,
-                    self.propagate_changes_with_batch_transaction(
-                        batch,
-                        merk_cache,
-                        &path,
-                        transaction,
-                        grove_version,
-                    )
-                );
+                    let mut merk_to_delete_tree_from = cost_return_on_error!(
+                        &mut cost,
+                        Merk::open_layered_with_root_key(
+                            storage,
+                            subtree_to_delete_from.root_key(),
+                            tree_type,
+                            Some(&Element::value_defined_cost_for_serialized_value),
+                            grove_version,
+                        )
+                        .map_err(|e| {
+                            Error::CorruptedData(format!(
+                                "cannot open a subtree with given root key: {e}"
+                            ))
+                        })
+                    );
+                    // We are deleting a tree, a tree uses 3 bytes
+                    cost_return_on_error_into!(
+                        &mut cost,
+                        Element::delete_with_sectioned_removal_bytes(
+                            &mut merk_to_delete_tree_from,
+                            key,
+                            Some(options.as_merk_options()),
+                            true,
+                            parent_tree_type,
+                            sectioned_removal,
+                            grove_version,
+                        )
+                    );
+                    let mut merk_cache: HashMap<
+                        SubtreePath<B>,
+                        Merk<PrefixedRocksDbTransactionContext>,
+                    > = HashMap::default();
+                    merk_cache.insert(path.clone(), merk_to_delete_tree_from);
+                    cost_return_on_error!(
+                        &mut cost,
+                        self.propagate_changes_with_batch_transaction(
+                            batch,
+                            merk_cache,
+                            &path,
+                            transaction,
+                            grove_version,
+                        )
+                    );
+                } else {
+                    // We are deleting a tree, a tree uses 3 bytes
+                    cost_return_on_error_into!(
+                        &mut cost,
+                        Element::delete_with_sectioned_removal_bytes(
+                            &mut subtree_to_delete_from,
+                            key,
+                            Some(options.as_merk_options()),
+                            true,
+                            parent_tree_type,
+                            sectioned_removal,
+                            grove_version,
+                        )
+                    );
+                    let mut merk_cache: HashMap<
+                        SubtreePath<B>,
+                        Merk<PrefixedRocksDbTransactionContext>,
+                    > = HashMap::default();
+                    merk_cache.insert(path.clone(), subtree_to_delete_from);
+                    cost_return_on_error!(
+                        &mut cost,
+                        self.propagate_changes_with_batch_transaction(
+                            batch,
+                            merk_cache,
+                            &path,
+                            transaction,
+                            grove_version,
+                        )
+                    );
+                }
             } else {
                 // We are deleting a tree, a tree uses 3 bytes
                 cost_return_on_error_into!(
@@ -896,7 +931,7 @@ impl GroveDb {
                         key,
                         Some(options.as_merk_options()),
                         true,
-                        uses_sum_tree,
+                        parent_tree_type,
                         sectioned_removal,
                         grove_version,
                     )
@@ -925,7 +960,7 @@ impl GroveDb {
                     key,
                     Some(options.as_merk_options()),
                     false,
-                    uses_sum_tree,
+                    parent_tree_type,
                     sectioned_removal,
                     grove_version,
                 )
@@ -1509,6 +1544,140 @@ mod tests {
             .get([TEST_LEAF].as_ref(), b"key4", None, grove_version)
             .unwrap()
             .is_ok());
+    }
+
+    #[test]
+    fn test_non_empty_tree_delete_under_count_tree_parent_updates_count() {
+        let grove_version = GroveVersion::latest();
+        let db = make_test_grovedb(grove_version);
+
+        db.insert(
+            [TEST_LEAF].as_ref(),
+            b"parent",
+            Element::empty_count_tree(),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful count tree insert");
+        db.insert(
+            [TEST_LEAF, b"parent"].as_ref(),
+            b"child",
+            Element::empty_tree(),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful child tree insert");
+        db.insert(
+            [TEST_LEAF, b"parent", b"child"].as_ref(),
+            b"leaf",
+            Element::new_item(b"value".to_vec()),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful child item insert");
+
+        let before = db
+            .get([TEST_LEAF].as_ref(), b"parent", None, grove_version)
+            .unwrap()
+            .expect("expected parent count tree");
+        assert!(matches!(before, Element::CountTree(_, 1, _)));
+
+        db.delete(
+            [TEST_LEAF, b"parent"].as_ref(),
+            b"child",
+            Some(DeleteOptions {
+                allow_deleting_non_empty_trees: true,
+                deleting_non_empty_trees_returns_error: false,
+                ..Default::default()
+            }),
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("delete non-empty child tree");
+
+        let after = db
+            .get([TEST_LEAF].as_ref(), b"parent", None, grove_version)
+            .unwrap()
+            .expect("expected parent count tree");
+        assert!(matches!(after, Element::CountTree(_, 0, _)));
+        let issues = db
+            .verify_grovedb(None, false, true, grove_version)
+            .expect("verify grovedb");
+        assert!(issues.is_empty(), "verification issues: {:?}", issues);
+    }
+
+    #[test]
+    fn test_non_empty_tree_delete_under_count_sum_tree_parent_updates_count_and_sum() {
+        let grove_version = GroveVersion::latest();
+        let db = make_test_grovedb(grove_version);
+
+        db.insert(
+            [TEST_LEAF].as_ref(),
+            b"parent",
+            Element::empty_count_sum_tree(),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful count sum tree insert");
+        db.insert(
+            [TEST_LEAF, b"parent"].as_ref(),
+            b"child",
+            Element::empty_sum_tree(),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful child sum tree insert");
+        db.insert(
+            [TEST_LEAF, b"parent", b"child"].as_ref(),
+            b"leaf",
+            Element::new_sum_item(7),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful child sum item insert");
+
+        let before = db
+            .get([TEST_LEAF].as_ref(), b"parent", None, grove_version)
+            .unwrap()
+            .expect("expected parent count sum tree");
+        assert!(matches!(before, Element::CountSumTree(_, 1, 7, _)));
+
+        db.delete(
+            [TEST_LEAF, b"parent"].as_ref(),
+            b"child",
+            Some(DeleteOptions {
+                allow_deleting_non_empty_trees: true,
+                deleting_non_empty_trees_returns_error: false,
+                ..Default::default()
+            }),
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("delete non-empty child tree");
+
+        let after = db
+            .get([TEST_LEAF].as_ref(), b"parent", None, grove_version)
+            .unwrap()
+            .expect("expected parent count sum tree");
+        assert!(matches!(after, Element::CountSumTree(_, 0, 0, _)));
+        let issues = db
+            .verify_grovedb(None, false, true, grove_version)
+            .expect("verify grovedb");
+        assert!(issues.is_empty(), "verification issues: {:?}", issues);
     }
 
     #[test]
