@@ -26,7 +26,6 @@ use std::collections::{BTreeSet, HashMap};
 
 #[cfg(feature = "minimal")]
 pub use delete_up_tree::DeleteUpTreeOptions;
-use grovedb_costs::cost_return_on_error_into;
 #[cfg(feature = "minimal")]
 use grovedb_costs::{
     cost_return_on_error,
@@ -34,8 +33,7 @@ use grovedb_costs::{
     CostResult, CostsExt, OperationCost,
 };
 use grovedb_merk::element::{
-    costs::ElementCostExtensions, decode::ElementDecodeExtensions,
-    delete::ElementDeleteFromStorageExtensions, tree_type::ElementTreeTypeExtensions,
+    decode::ElementDecodeExtensions, tree_type::ElementTreeTypeExtensions,
 };
 #[cfg(feature = "minimal")]
 use grovedb_merk::{proofs::Query, KVIterator, MaybeTree};
