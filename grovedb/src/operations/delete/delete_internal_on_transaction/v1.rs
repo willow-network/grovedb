@@ -17,7 +17,9 @@ use grovedb_merk::{
     Error as MerkError, Merk,
 };
 use grovedb_path::SubtreePath;
-use grovedb_storage::{rocksdb_storage::PrefixedRocksDbTransactionContext, Storage, StorageBatch};
+use grovedb_storage::{
+    rocksdb_storage::PrefixedRocksDbTransactionContext, Storage, StorageBatch, StorageContext,
+};
 use grovedb_version::version::GroveVersion;
 
 use super::super::DeleteOptions;
