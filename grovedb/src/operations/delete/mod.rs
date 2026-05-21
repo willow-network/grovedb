@@ -991,7 +991,7 @@ mod tests {
         storage_cost::{removal::StorageRemovedBytes::BasicStorageRemoval, StorageCost},
         OperationCost,
     };
-    use grovedb_version::version::GroveVersion;
+    use grovedb_version::version::{v2::GROVE_V2, GroveVersion};
     use pretty_assertions::assert_eq;
 
     use crate::{
@@ -1611,6 +1611,68 @@ mod tests {
             .verify_grovedb(None, false, true, grove_version)
             .expect("verify grovedb");
         assert!(issues.is_empty(), "verification issues: {:?}", issues);
+    }
+
+    #[test]
+    fn test_legacy_non_empty_tree_delete_keeps_version_0_path() {
+        let grove_version = &GROVE_V2;
+        let db = make_test_grovedb(grove_version);
+
+        db.insert(
+            [TEST_LEAF].as_ref(),
+            b"parent",
+            Element::empty_count_tree(),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful count tree insert");
+        db.insert(
+            [TEST_LEAF, b"parent"].as_ref(),
+            b"child",
+            Element::empty_tree(),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful child tree insert");
+        db.insert(
+            [TEST_LEAF, b"parent", b"child"].as_ref(),
+            b"leaf",
+            Element::new_item(b"value".to_vec()),
+            None,
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("successful child item insert");
+
+        db.delete(
+            [TEST_LEAF, b"parent"].as_ref(),
+            b"child",
+            Some(DeleteOptions {
+                allow_deleting_non_empty_trees: true,
+                deleting_non_empty_trees_returns_error: false,
+                ..Default::default()
+            }),
+            None,
+            grove_version,
+        )
+        .unwrap()
+        .expect("legacy delete non-empty child tree");
+
+        assert!(matches!(
+            db.get(
+                [TEST_LEAF, b"parent"].as_ref(),
+                b"child",
+                None,
+                grove_version
+            )
+            .unwrap(),
+            Err(Error::PathKeyNotFound(_))
+        ));
     }
 
     #[test]
