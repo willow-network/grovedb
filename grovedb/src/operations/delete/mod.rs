@@ -56,6 +56,13 @@ use crate::{
 };
 
 #[cfg(feature = "minimal")]
+fn cannot_open_subtree_with_root_key_error(error: MerkError) -> Error {
+    Error::CorruptedData(format!(
+        "cannot open a subtree with given root key: {error}"
+    ))
+}
+
+#[cfg(feature = "minimal")]
 #[derive(Clone)]
 /// Clear options
 pub struct ClearOptions {
@@ -729,10 +736,8 @@ impl GroveDb {
             .operations
             .delete
             .delete_internal_on_transaction;
-        check_grovedb_v0_or_v1_with_cost!(
-            "delete_internal_on_transaction",
-            delete_internal_version
-        );
+        #[rustfmt::skip]
+        check_grovedb_v0_or_v1_with_cost!("delete_internal_on_transaction", delete_internal_version);
 
         let mut cost = OperationCost::default();
 
@@ -858,11 +863,7 @@ impl GroveDb {
                             Some(&Element::value_defined_cost_for_serialized_value),
                             grove_version,
                         )
-                        .map_err(|e| {
-                            Error::CorruptedData(format!(
-                                "cannot open a subtree with given root key: {e}"
-                            ))
-                        })
+                        .map_err(cannot_open_subtree_with_root_key_error)
                     );
                     // We are deleting a tree, a tree uses 3 bytes
                     cost_return_on_error_into!(
@@ -1002,6 +1003,20 @@ mod tests {
         },
         Element, Error,
     };
+
+    #[test]
+    fn test_open_subtree_root_key_error_mapping() {
+        let err = super::cannot_open_subtree_with_root_key_error(
+            grovedb_merk::Error::CorruptedState("bad root"),
+        );
+
+        assert!(matches!(
+            err,
+            Error::CorruptedData(message)
+                if message.contains("cannot open a subtree with given root key")
+                    && message.contains("bad root")
+        ));
+    }
 
     #[test]
     fn test_empty_subtree_deletion_without_transaction() {
