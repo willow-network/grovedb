@@ -169,11 +169,7 @@ impl GroveDb {
                         Some(&Element::value_defined_cost_for_serialized_value),
                         grove_version,
                     )
-                    .map_err(|e| {
-                        Error::CorruptedData(format!(
-                            "cannot open a subtree with given root key: {e}"
-                        ))
-                    })
+                    .map_err(super::super::cannot_open_subtree_with_root_key_error)
                 );
                 // We are deleting a tree, a tree uses 3 bytes
                 cost_return_on_error_into!(
