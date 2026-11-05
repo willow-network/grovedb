@@ -10,7 +10,7 @@ use grovedb_costs::{
 };
 
 #[cfg(any(feature = "minimal", feature = "verify"))]
-use super::{Node, Op};
+use super::{Node, Op, ProofRules};
 #[cfg(any(feature = "minimal", feature = "verify"))]
 use crate::tree::{combine_hash, kv_digest_to_kv_hash, kv_hash, node_hash, value_hash, NULL_HASH};
 #[cfg(any(feature = "minimal", feature = "verify"))]
@@ -261,6 +261,37 @@ impl Tree {
         Ok(()).wrap_with_cost(cost)
     }
 
+    /// Whether this node's hash is taken verbatim from the node, ignoring any
+    /// children attached to the reconstructed proof tree. In this version only
+    /// `Node::Hash` is opaque: every other node's hash covers its children.
+    #[cfg(any(feature = "minimal", feature = "verify"))]
+    pub const fn is_opaque(&self) -> bool {
+        matches!(self.node, Node::Hash(_))
+    }
+
+    /// [`Tree::attach`], refusing (under [`ProofRules::Strict`]) to attach
+    /// anything beneath an opaque node. An opaque node's hash excludes its
+    /// reconstructed children, so a child hung beneath one is unauthenticated
+    /// data the root-hash check can never catch, while the query verifier
+    /// still visits it as a pushed node (upstream dashpay/grovedb `d998d764`).
+    /// Honest provers never emit an opaque node with children.
+    #[cfg(any(feature = "minimal", feature = "verify"))]
+    pub(crate) fn attach_with_rules(
+        &mut self,
+        left: bool,
+        child: Self,
+        rules: ProofRules,
+    ) -> CostResult<(), Error> {
+        if rules.opaque_nodes_childless() && self.is_opaque() {
+            return Err(Error::InvalidProofError(format!(
+                "opaque proof node {} cannot have children: its hash excludes them",
+                self.node
+            )))
+            .wrap_with_cost(OperationCost::default());
+        }
+        self.attach(left, child)
+    }
+
     /// Returns the already-computed hash for this tree node's child on the
     /// given side, if any. If there is no child, returns the null hash
     /// (zero-filled).
@@ -357,7 +388,27 @@ impl<'a> Iterator for LayerIter<'a> {
 /// `visit_node` will be called once for every push operation in the proof, in
 /// key-order. If `visit_node` returns an `Err` result, it will halt the
 /// execution and `execute` will return the error.
-pub(crate) fn execute<I, F>(ops: I, collapse: bool, mut visit_node: F) -> CostResult<Tree, Error>
+///
+/// Runs under [`ProofRules::Strict`]; see [`execute_with_rules`].
+#[cfg_attr(not(feature = "minimal"), allow(dead_code))]
+pub(crate) fn execute<I, F>(ops: I, collapse: bool, visit_node: F) -> CostResult<Tree, Error>
+where
+    I: IntoIterator<Item = Result<Op, Error>>,
+    F: FnMut(&Node) -> Result<(), Error>,
+{
+    execute_with_rules(ops, collapse, ProofRules::Strict, visit_node)
+}
+
+#[cfg(any(feature = "minimal", feature = "verify"))]
+/// [`execute`] under the given rules. [`ProofRules::V310`] is grovedb-merk
+/// 3.1.0's `execute`; [`ProofRules::Strict`] additionally refuses a child
+/// beneath an opaque (`Hash`) node.
+pub(crate) fn execute_with_rules<I, F>(
+    ops: I,
+    collapse: bool,
+    rules: ProofRules,
+    mut visit_node: F,
+) -> CostResult<Tree, Error>
 where
     I: IntoIterator<Item = Result<Op, Error>>,
     F: FnMut(&Node) -> Result<(), Error>,
@@ -382,13 +433,14 @@ where
                 );
                 cost_return_on_error!(
                     &mut cost,
-                    parent.attach(
+                    parent.attach_with_rules(
                         true,
                         if collapse {
                             child.into_hash().unwrap_add_cost(&mut cost)
                         } else {
                             child
                         },
+                        rules,
                     )
                 );
                 stack.push(parent);
@@ -400,13 +452,14 @@ where
                 );
                 cost_return_on_error!(
                     &mut cost,
-                    parent.attach(
+                    parent.attach_with_rules(
                         false,
                         if collapse {
                             child.into_hash().unwrap_add_cost(&mut cost)
                         } else {
                             child
-                        }
+                        },
+                        rules,
                     )
                 );
                 stack.push(parent);
@@ -418,13 +471,14 @@ where
                 );
                 cost_return_on_error!(
                     &mut cost,
-                    parent.attach(
+                    parent.attach_with_rules(
                         false,
                         if collapse {
                             child.into_hash().unwrap_add_cost(&mut cost)
                         } else {
                             child
                         },
+                        rules,
                     )
                 );
                 stack.push(parent);
@@ -436,13 +490,14 @@ where
                 );
                 cost_return_on_error!(
                     &mut cost,
-                    parent.attach(
+                    parent.attach_with_rules(
                         true,
                         if collapse {
                             child.into_hash().unwrap_add_cost(&mut cost)
                         } else {
                             child
                         },
+                        rules,
                     )
                 );
                 stack.push(parent);
@@ -699,5 +754,86 @@ mod test {
                 key: vec![3]
             }
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Opaque nodes stay childless (backport of dashpay/grovedb d998d764)
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn strict_attach_to_hash_node_is_refused() {
+        for left in [true, false] {
+            let mut parent: ProofTree = Node::Hash([0; 32]).into();
+            let child: ProofTree = Node::KV(vec![1], vec![1]).into();
+            let result = parent
+                .attach_with_rules(left, child, ProofRules::Strict)
+                .unwrap();
+            assert!(matches!(result, Err(Error::InvalidProofError(_))));
+            assert!(parent.left.is_none() && parent.right.is_none());
+
+            // 3.1.0 accepted it
+            let child: ProofTree = Node::KV(vec![1], vec![1]).into();
+            parent
+                .attach_with_rules(left, child, ProofRules::V310)
+                .unwrap()
+                .expect("3.1.0 rules attach beneath Hash");
+        }
+    }
+
+    #[test]
+    fn kv_hash_and_kv_nodes_still_take_children() {
+        for parent_node in [
+            Node::KVHash([0; 32]),
+            Node::KV(vec![5], vec![5]),
+            Node::KVValueHash(vec![5], vec![5], [1; 32]),
+            Node::KVDigest(vec![5], [1; 32]),
+            Node::KVRefValueHash(vec![5], vec![5], [1; 32]),
+        ] {
+            let mut parent: ProofTree = parent_node.into();
+            parent
+                .attach_with_rules(true, Node::KV(vec![1], vec![1]).into(), ProofRules::Strict)
+                .unwrap()
+                .expect("left child");
+            parent
+                .attach_with_rules(false, Node::KV(vec![9], vec![9]).into(), ProofRules::Strict)
+                .unwrap()
+                .expect("right child");
+        }
+    }
+
+    /// The forged KV hung under a Hash leaf is visited (it would become a
+    /// query result) while the root hash is the honest one.
+    #[test]
+    fn forged_push_under_hash_node() {
+        let left_hash = [0x11; 32];
+        let right_hash = [0x22; 32];
+        let ops = || {
+            vec![
+                Op::Push(Node::Hash(left_hash)),
+                Op::Push(Node::KV(vec![3], b"forged".to_vec())),
+                Op::Child,
+                Op::Push(Node::KV(vec![5], vec![5])),
+                Op::Parent,
+                Op::Push(Node::Hash(right_hash)),
+                Op::Child,
+            ]
+        };
+        let honest_root = {
+            let kv = kv_hash(&[5], &[5]).unwrap();
+            node_hash(&kv, &left_hash, &right_hash).unwrap()
+        };
+
+        let mut visited = vec![];
+        let tree = execute_with_rules(ops().into_iter().map(Ok), true, ProofRules::V310, |n| {
+            visited.push(n.clone());
+            Ok(())
+        })
+        .unwrap()
+        .expect("3.1.0 rules accept it");
+        assert_eq!(tree.hash().unwrap(), honest_root);
+        assert!(visited.contains(&Node::KV(vec![3], b"forged".to_vec())));
+
+        let result = execute(ops().into_iter().map(Ok), true, |_| Ok(())).unwrap();
+        assert!(matches!(result, Err(Error::InvalidProofError(_))));
     }
 }

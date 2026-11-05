@@ -4881,4 +4881,132 @@ mod test {
             .unwrap()
             .expect("verify failed");
     }
+
+    // ---------------------------------------------------------------------
+    // ProofRules: strict vs 3.1.0 (backports of dashpay/grovedb d998d764 and
+    // 86562f65)
+    // ---------------------------------------------------------------------
+
+    /// A query proof for the honest tree `[3] <- [5] -> [7]` that claims key
+    /// `[3]` holds `"forged"`, hung under the left Hash leaf.
+    #[test]
+    fn forged_row_under_hash_node_strict_vs_v310() {
+        let tree = make_3_node_tree();
+        let expected_root = tree.hash().unwrap();
+        let left_hash = *tree.child_hash(true);
+        let right_hash = *tree.child_hash(false);
+        let malicious = [
+            Op::Push(Node::Hash(left_hash)),
+            Op::Push(Node::KV(vec![3], b"forged".to_vec())),
+            Op::Child,
+            Op::Push(Node::KV(vec![5], vec![5])),
+            Op::Parent,
+            Op::Push(Node::Hash(right_hash)),
+            Op::Child,
+        ];
+        let mut bytes = vec![];
+        encode_into(malicious.iter(), &mut bytes);
+        let mut query = Query::new();
+        query.insert_key(vec![3]);
+
+        let legacy = query
+            .verify_proof_v310(bytes.as_slice(), None, true, expected_root)
+            .unwrap()
+            .expect("3.1.0 accepted the forged row");
+        assert_eq!(legacy.result_set[0].value, Some(b"forged".to_vec()));
+
+        let strict = query
+            .verify_proof(bytes.as_slice(), None, true, expected_root)
+            .unwrap();
+        assert!(
+            matches!(strict, Err(Error::InvalidProofError(ref m)) if m.contains("opaque")),
+            "{strict:?}"
+        );
+    }
+
+    #[test]
+    fn large_value_query_proof_strict_vs_v310() {
+        let grove_version = GroveVersion::latest();
+        for len in [65_535usize, 65_536, 512 * 1024, 1 << 20] {
+            let big: Vec<u8> = (0..len).map(|i| (i % 249) as u8).collect();
+            let mut tree = TreeNode::new(vec![5], big.clone(), None, BasicMerkNode)
+                .unwrap()
+                .attach(
+                    true,
+                    Some(TreeNode::new(vec![3], vec![3], None, BasicMerkNode).unwrap()),
+                )
+                .attach(
+                    false,
+                    Some(TreeNode::new(vec![7], vec![7], None, BasicMerkNode).unwrap()),
+                );
+            tree.commit(&mut NoopCommit {}, &|_, _| Ok(0))
+                .unwrap()
+                .expect("commit failed");
+            let expected_root = tree.hash().unwrap();
+            let mut walker = RefWalker::new(&mut tree, PanicSource {});
+            let (proof, ..) = walker
+                .create_proof(&[QueryItem::Key(vec![5])], None, true, grove_version)
+                .unwrap()
+                .expect("failed to create proof");
+            let mut bytes = vec![];
+            encode_into(proof.iter(), &mut bytes);
+            let mut query = Query::new();
+            query.insert_key(vec![5]);
+
+            let strict = query
+                .verify_proof(bytes.as_slice(), None, true, expected_root)
+                .unwrap()
+                .expect("strict verifies a large value");
+            assert_eq!(strict.result_set[0].value.as_deref(), Some(big.as_slice()));
+
+            let legacy = query
+                .verify_proof_v310(bytes.as_slice(), None, true, expected_root)
+                .unwrap();
+            if len < 65_536 {
+                assert_eq!(legacy.expect("small value").result_set, strict.result_set);
+            } else {
+                assert!(legacy.is_err(), "3.1.0 has no large-value opcode");
+            }
+        }
+    }
+
+    #[test]
+    fn supplied_value_hash_hook_sees_every_kv_value_hash_node() {
+        let grove_version = GroveVersion::latest();
+        let mut tree = make_3_node_tree();
+        let expected_root = tree.hash().unwrap();
+        let mut walker = RefWalker::new(&mut tree, PanicSource {});
+        let (proof, ..) = walker
+            .create_proof(
+                &[QueryItem::Key(vec![3]), QueryItem::Key(vec![7])],
+                None,
+                true,
+                grove_version,
+            )
+            .unwrap()
+            .expect("failed to create proof");
+        let mut bytes = vec![];
+        encode_into(proof.iter(), &mut bytes);
+        let mut query = Query::new();
+        query.insert_key(vec![3]);
+        query.insert_key(vec![7]);
+
+        let mut seen = vec![];
+        let (root, _) = query
+            .execute_proof_with_rules(&bytes, None, true, ProofRules::Strict, |value, _| {
+                seen.push(value.to_vec());
+                Ok(())
+            })
+            .unwrap()
+            .expect("verifies");
+        assert_eq!(root, expected_root);
+        assert_eq!(seen, vec![vec![3], vec![7]]);
+
+        let refused = query
+            .execute_proof_with_rules(&bytes, None, true, ProofRules::Strict, |_, _| {
+                Err(Error::InvalidProofError("hook".to_string()))
+            })
+            .unwrap();
+        assert!(matches!(refused, Err(Error::InvalidProofError(ref m)) if m == "hook"));
+    }
 }

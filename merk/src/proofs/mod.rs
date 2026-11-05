@@ -21,6 +21,38 @@ pub use tree::Tree;
 #[cfg(any(feature = "minimal", feature = "verify"))]
 use crate::{tree::CryptoHash, TreeFeatureType};
 
+/// The rules a proof is decoded and verified under.
+///
+/// Every verification entry point that does not name its rules uses
+/// [`ProofRules::Strict`]. The `*_v310` entry points use [`ProofRules::V310`]
+/// so that a caller that must reproduce grovedb 3.1.0's verdicts (a chain
+/// replaying blocks verified with 3.1.0) can do so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ProofRules {
+    /// Current rules:
+    /// - the large-value opcodes (0x20..=0x23, 0x28..=0x2b) decode;
+    /// - a `Hash` node (whose hash ignores children) may not have children;
+    /// - at the GroveDB layer, the element checks documented on
+    ///   `GroveDb::verify_query`.
+    #[default]
+    Strict,
+    /// Exactly grovedb / grovedb-merk 3.1.0: large-value opcodes are unknown
+    /// opcodes, `Hash` nodes may take children, and no element checks run.
+    V310,
+}
+
+impl ProofRules {
+    /// Whether the large-value opcodes decode.
+    pub const fn large_value_ops(self) -> bool {
+        matches!(self, ProofRules::Strict)
+    }
+
+    /// Whether opaque (`Hash`) nodes must stay childless.
+    pub const fn opaque_nodes_childless(self) -> bool {
+        matches!(self, ProofRules::Strict)
+    }
+}
+
 #[cfg(any(feature = "minimal", feature = "verify"))]
 /// A proof operator, executed to verify the data in a Merkle proof.
 #[derive(Debug, Clone, PartialEq, Eq)]

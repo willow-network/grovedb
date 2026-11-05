@@ -1,0 +1,21 @@
+[package]
+name = "grovedb-v310-compat"
+description = "Differential tests: this fork's legacy (_v310) proof verification and proof encoding against crates.io grovedb 3.1.0"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Its own workspace, so the main workspace's lockfile and members stay untouched.
+[workspace]
+
+[dependencies]
+
+[dev-dependencies]
+grovedb = { path = "../grovedb" }
+grovedb-merk = { path = "../merk" }
+grovedb-version = { path = "../grovedb-version" }
+grovedb_v310 = { package = "grovedb", version = "=3.1.0" }
+grovedb_merk_v310 = { package = "grovedb-merk", version = "=3.1.0" }
+grovedb_version_v310 = { package = "grovedb-version", version = "=3.1.0" }
+bincode = { version = "=2.0.0-rc.3" }
+tempfile = "3"

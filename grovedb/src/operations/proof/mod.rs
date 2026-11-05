@@ -11,7 +11,7 @@ use bincode::{Decode, Encode};
 use grovedb_merk::{
     proofs::{
         query::{Key, VerifyOptions},
-        Decoder, Node, Op,
+        Decoder, Node, Op, ProofRules,
     },
     CryptoHash,
 };
@@ -77,7 +77,7 @@ impl GroveDBProof {
         options: VerifyOptions,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, Vec<PathKeyOptionalElementTrio>), Error> {
-        GroveDb::verify_proof_internal(self, query, options, grove_version)
+        GroveDb::verify_proof_internal(self, query, options, ProofRules::Strict, grove_version)
             .map(|(root_hash, _, results)| (root_hash, results))
     }
 
@@ -96,6 +96,7 @@ impl GroveDBProof {
                 verify_proof_succinctness: false,
                 include_empty_trees_in_result: true,
             },
+            ProofRules::Strict,
             grove_version,
         )
         .map(|(root_hash, _, results)| (root_hash, results))
@@ -116,6 +117,7 @@ impl GroveDBProof {
                 verify_proof_succinctness: true,
                 include_empty_trees_in_result: false,
             },
+            ProofRules::Strict,
             grove_version,
         )
         .map(|(root_hash, _, results)| (root_hash, results))
@@ -136,6 +138,7 @@ impl GroveDBProof {
                 verify_proof_succinctness: true,
                 include_empty_trees_in_result: false,
             },
+            ProofRules::Strict,
             grove_version,
         )
         .map(|(root_hash, _, results)| (root_hash, results))
@@ -156,6 +159,7 @@ impl GroveDBProof {
                 verify_proof_succinctness: false,
                 include_empty_trees_in_result: false,
             },
+            ProofRules::Strict,
             grove_version,
         )
         .map(|(root_hash, _, results)| (root_hash, results))
@@ -176,6 +180,7 @@ impl GroveDBProof {
                 verify_proof_succinctness: false,
                 include_empty_trees_in_result: false,
             },
+            ProofRules::Strict,
             grove_version,
         )
         .map(|(root_hash, _, results)| (root_hash, results))

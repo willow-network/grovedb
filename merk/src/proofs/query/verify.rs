@@ -5,13 +5,18 @@ use std::fmt;
 use grovedb_costs::{cost_return_on_error, CostResult, CostsExt, OperationCost};
 
 #[cfg(feature = "minimal")]
+use crate::proofs::tree::execute;
+#[cfg(feature = "minimal")]
 use crate::proofs::{
     query::{Map, MapBuilder},
     Op,
 };
 use crate::{
     error::Error,
-    proofs::{hex_to_ascii, query::ProofStatus, tree::execute, Decoder, Node, Query},
+    proofs::{
+        hex_to_ascii, query::ProofStatus, tree::execute_with_rules, Decoder, Node, ProofRules,
+        Query,
+    },
     tree::value_hash,
     CryptoHash as MerkHash, CryptoHash,
 };
@@ -77,12 +82,53 @@ impl Query {
     /// the value of `B`. Keys proven to be absent in the tree will have an
     /// entry of `None`, keys that have a proven value will have an entry of
     /// `Some(value)`.
+    ///
+    /// Runs under [`ProofRules::Strict`]: the large-value opcodes decode and a
+    /// `Hash` node may not have children. Merk does not know GroveDB's element
+    /// encoding, so the KV→KVValueHash check lives in GroveDB (which passes it
+    /// to [`Query::execute_proof_with_rules`]).
     pub fn execute_proof(
         &self,
         bytes: &[u8],
         limit: Option<u16>,
         left_to_right: bool,
     ) -> CostResult<(MerkHash, ProofVerificationResult), Error> {
+        self.execute_proof_with_rules(bytes, limit, left_to_right, ProofRules::Strict, |_, _| {
+            Ok(())
+        })
+    }
+
+    #[cfg(any(feature = "minimal", feature = "verify"))]
+    /// [`Query::execute_proof`] exactly as grovedb-merk 3.1.0 ran it.
+    pub fn execute_proof_v310(
+        &self,
+        bytes: &[u8],
+        limit: Option<u16>,
+        left_to_right: bool,
+    ) -> CostResult<(MerkHash, ProofVerificationResult), Error> {
+        self.execute_proof_with_rules(bytes, limit, left_to_right, ProofRules::V310, |_, _| Ok(()))
+    }
+
+    #[cfg(any(feature = "minimal", feature = "verify"))]
+    /// [`Query::execute_proof`] under the given rules.
+    ///
+    /// `check_supplied_value_hash(value, value_hash)` is called for every
+    /// `KVValueHash` node, whose value hash the prover supplies instead of the
+    /// verifier computing it from the value; an `Err` aborts verification.
+    /// GroveDB uses it to refuse an item element carried this way with bytes
+    /// that do not hash to the supplied value hash. Under
+    /// [`ProofRules::V310`] pass a no-op to reproduce 3.1.0.
+    pub fn execute_proof_with_rules<C>(
+        &self,
+        bytes: &[u8],
+        limit: Option<u16>,
+        left_to_right: bool,
+        rules: ProofRules,
+        mut check_supplied_value_hash: C,
+    ) -> CostResult<(MerkHash, ProofVerificationResult), Error>
+    where
+        C: FnMut(&[u8], &CryptoHash) -> Result<(), Error>,
+    {
         #[cfg(feature = "proof_debug")]
         {
             println!(
@@ -105,9 +151,9 @@ impl Query {
         let original_limit = limit;
         let mut current_limit = limit;
 
-        let ops = Decoder::new(bytes);
+        let ops = Decoder::with_rules(bytes, rules);
 
-        let root_wrapped = execute(ops, true, |node| {
+        let root_wrapped = execute_with_rules(ops, true, rules, |node| {
             let mut execute_node = |key: &Vec<u8>,
                                     value: Option<&Vec<u8>>,
                                     value_hash: CryptoHash|
@@ -293,6 +339,7 @@ impl Query {
                     {
                         println!("Processing KVValueHash node");
                     }
+                    check_supplied_value_hash(value, value_hash)?;
                     execute_node(key, Some(value), *value_hash)?;
                 }
                 Node::KVDigest(key, value_hash) => {
@@ -362,7 +409,8 @@ impl Query {
     }
 
     #[cfg(any(feature = "minimal", feature = "verify"))]
-    /// Verifies the encoded proof with the given query and expected hash
+    /// Verifies the encoded proof with the given query and expected hash, under
+    /// [`ProofRules::Strict`].
     pub fn verify_proof(
         &self,
         bytes: &[u8],
@@ -370,7 +418,33 @@ impl Query {
         left_to_right: bool,
         expected_hash: MerkHash,
     ) -> CostResult<ProofVerificationResult, Error> {
-        self.execute_proof(bytes, limit, left_to_right)
+        Self::check_root(
+            self.execute_proof(bytes, limit, left_to_right),
+            expected_hash,
+        )
+    }
+
+    #[cfg(any(feature = "minimal", feature = "verify"))]
+    /// [`Query::verify_proof`] exactly as grovedb-merk 3.1.0 ran it.
+    pub fn verify_proof_v310(
+        &self,
+        bytes: &[u8],
+        limit: Option<u16>,
+        left_to_right: bool,
+        expected_hash: MerkHash,
+    ) -> CostResult<ProofVerificationResult, Error> {
+        Self::check_root(
+            self.execute_proof_v310(bytes, limit, left_to_right),
+            expected_hash,
+        )
+    }
+
+    #[cfg(any(feature = "minimal", feature = "verify"))]
+    fn check_root(
+        executed: CostResult<(MerkHash, ProofVerificationResult), Error>,
+        expected_hash: MerkHash,
+    ) -> CostResult<ProofVerificationResult, Error> {
+        executed
             .map_ok(|(root_hash, verification_result)| {
                 if root_hash == expected_hash {
                     Ok(verification_result)

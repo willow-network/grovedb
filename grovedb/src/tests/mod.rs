@@ -8,6 +8,7 @@ mod sum_tree_tests;
 
 mod count_sum_tree_tests;
 mod count_tree_tests;
+mod proof_rules_tests;
 mod tree_hashes_tests;
 
 use std::{
