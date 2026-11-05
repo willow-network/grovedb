@@ -972,8 +972,10 @@ impl GroveDb {
     /// - below `query.path`, refuses a tree with a root key that a subquery
     ///   descends but that has no lower layer. This refuses some honest limited
     ///   subquery proofs from 3.1.0's prover, whose limit accounting differs
-    ///   from the verifier's (it stops early), and every subquery into a
-    ///   non-empty `CountSumTree` (its prover never descends one);
+    ///   from the verifier's (it stops early), every subquery into a non-empty
+    ///   `CountSumTree` (its prover never descends one), and a reference to a
+    ///   non-empty tree under a subquery (its prover sends the tree's bytes in
+    ///   a `KVRefValueHash` node, with no lower layer);
     /// - decodes the envelope and each element with a claim bound of about 32
     ///   times its length (capped at 256 MiB and 64 MiB; where 3.1.0,
     ///   unbounded, aborts the process on a lying length), refuses an envelope

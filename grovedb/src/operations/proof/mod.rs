@@ -28,12 +28,22 @@ use crate::{
 pub const MAX_STRICT_PROOF_DEPTH: usize = 64;
 
 /// The deepest the `_v310` verification entry points let a proof's layers nest
-/// below its root layer. bincode decodes each level of `LayerProof` nesting one
-/// level deeper on the stack: grovedb 3.1.0 decodes 3,000 levels on a 2 MiB
-/// thread stack (as tendermint-abci's connection threads have) and dies of a
-/// stack overflow at 6,000. Refusing a deeper envelope changes 3.1.0's verdict
-/// only at depths where 3.1.0 itself could abort the process.
-pub const MAX_V310_PROOF_DEPTH: usize = 3_000;
+/// below its root layer.
+///
+/// bincode decodes each level of `LayerProof` nesting one level deeper on the
+/// stack. Measured with a release build on nightly-2026-04-12 on a fresh 2 MiB
+/// thread (the default `thread::spawn` stack, which tendermint-abci's
+/// connection threads run blocks on): grovedb 3.1.0 uses about 481 bytes of
+/// stack per level, returns for envelopes nested up to 4,354 deep and aborts
+/// the process with a stack overflow from 4,355 (earlier when its caller has
+/// already used some of the stack). This crate's decode uses about 370 bytes
+/// per level and returns for about 5,680 levels on the same thread.
+///
+/// So the limit sits between the two: every envelope 3.1.0 returns from on
+/// such a thread is decoded as 3.1.0 decodes it, an envelope refused here is
+/// one on which 3.1.0 aborts, and about 470 KiB of the thread is left for the
+/// caller's own frames at this depth.
+pub const MAX_V310_PROOF_DEPTH: usize = 4_400;
 
 /// Whether the serialized `GroveDBProof` in `bytes` nests its layers at most
 /// `max_depth` below its root layer (a proof with no lower layers has depth

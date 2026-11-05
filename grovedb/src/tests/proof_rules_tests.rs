@@ -1273,7 +1273,7 @@ fn envelope_depth_walk() {
     use crate::operations::proof::{
         envelope_depth_within, MAX_STRICT_PROOF_DEPTH, MAX_V310_PROOF_DEPTH,
     };
-    for depth in [1, 2, 64, 65, 3_000, 3_001] {
+    for depth in [1, 2, 64, 65, 3_000, 4_400, 4_401] {
         let p = nested_envelope(depth);
         assert!(envelope_depth_within(&p, depth), "{depth}");
         assert!(!envelope_depth_within(&p, depth - 1), "{depth}");

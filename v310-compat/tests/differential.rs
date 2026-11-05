@@ -1131,15 +1131,16 @@ fn on_stack<T: Send + 'static>(bytes: usize, f: impl FnOnce() -> T + Send + 'sta
         .unwrap()
 }
 
-/// At the `_v310` depth limit the fork verifies exactly as 3.1.0 (both on a
-/// stack big enough for 3.1.0's recursion); one deeper, the fork refuses
-/// without recursing (on a 256 KiB stack) where 3.1.0 might overflow.
+/// Up to the `_v310` depth limit (4,400; 3.1.0 aborts from 4,355 on a fresh
+/// 2 MiB thread) the fork verifies exactly as 3.1.0, both on a stack big
+/// enough for 3.1.0's recursion; one deeper, the fork refuses without
+/// recursing (on a 256 KiB stack).
 #[test]
 fn deep_nesting_v310_matches_v310_up_to_its_limit() {
     use grovedb::operations::proof::{
         envelope_depth_within, MAX_STRICT_PROOF_DEPTH, MAX_V310_PROOF_DEPTH,
     };
-    for depth in [1, 2, 63, 64, 65, 1_000, MAX_V310_PROOF_DEPTH] {
+    for depth in [1, 2, 63, 64, 65, 1_000, 3_001, 4_354, MAX_V310_PROOF_DEPTH] {
         let (fork, base) = on_stack(256 << 20, move || {
             let proof = nested_envelope(depth);
             let mut keys = Query::new();
