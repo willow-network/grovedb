@@ -18,8 +18,10 @@ use crate::operations::proof::util::{
 };
 use crate::{
     operations::proof::{
+        envelope_depth_within,
         util::{ProvedPathKeyOptionalValue, ProvedPathKeyValues},
-        GroveDBProof, GroveDBProofV0, LayerProof, ProveOptions,
+        GroveDBProof, GroveDBProofV0, LayerProof, ProveOptions, MAX_STRICT_PROOF_DEPTH,
+        MAX_V310_PROOF_DEPTH,
     },
     query_result_type::PathKeyOptionalElementTrio,
     Element, Error, GroveDb, PathQuery,
@@ -29,31 +31,74 @@ use crate::{
 /// bound).
 const STRICT_MAX_PROOF_BYTES: usize = 256 * 1024 * 1024;
 
-/// Decodes `bytes` with GroveDB's bincode configuration under a claim limit
-/// proportional to their length, for [`ProofRules::Strict`].
+/// The claim limit for decoding `len` bytes: the smallest power of two at
+/// least 32 times `len`, and at least 1 KiB; `None` past the largest class
+/// [`decode_in_class`] has.
 ///
 /// grovedb 3.1.0 decodes proofs and elements with no limit, and bincode
 /// 2.0.0-rc.3 resizes a byte string to its claimed length (zeroing it) before
 /// reading it: a few bytes claiming an enormous length abort the process, and
 /// a fixed large limit still lets each few bytes force a large zeroed
-/// allocation. So the limit is the smallest power of two at least 32 times
-/// the input's length, and at least 1 KiB. bincode also claims
-/// `len * size_of::<T>()` for a container of `T` before reading it (72 bytes
-/// for a lower-layer map entry, which takes at least 3 serialized bytes; 24
-/// for a reference path segment, at least 1), so honest data claims up to
-/// about 25 times its length, which the factor of 32 covers; a lying length
-/// can make the decoder allocate at most about 64 times the input.
-fn decode_bounded<T: bincode::Decode>(
-    bytes: &[u8],
-) -> Result<(T, usize), bincode::error::DecodeError> {
-    let class = bytes
-        .len()
+/// allocation. bincode also claims `len * size_of::<T>()` for a container of
+/// `T` before reading it, and releases that claim one element at a time as it
+/// decodes them. The containers a proof envelope and an element decode are
+/// byte strings (one byte claimed per byte read), `Vec<Vec<u8>>` (a reference
+/// path: 24 bytes claimed per segment, each at least 1 serialized byte) and
+/// `BTreeMap<Vec<u8>, LayerProof>` (the lower layers: 72 bytes claimed per
+/// entry, each at least 3 serialized bytes), so at most 24 bytes are claimed
+/// per serialized byte, and a decode that the input can satisfy claims at
+/// most 25 times the input's length. A claim past 32 times it cannot be
+/// satisfied, and a lying length can make the decoder allocate at most about
+/// 64 times the input.
+fn claim_class(len: usize) -> Option<usize> {
+    let class = len
         .saturating_mul(32)
         .max(1 << 10)
-        .checked_next_power_of_two()
-        .ok_or(bincode::error::DecodeError::LimitExceeded)?;
+        .checked_next_power_of_two()?;
+    (class <= MAX_CLAIM_CLASS).then_some(class)
+}
+
+#[cfg(target_pointer_width = "64")]
+const MAX_CLAIM_CLASS: usize = 1 << 33;
+#[cfg(not(target_pointer_width = "64"))]
+const MAX_CLAIM_CLASS: usize = 1 << 31;
+
+/// Decodes `bytes` with GroveDB's bincode configuration under
+/// `min(claim_class(len), cap)`, for [`ProofRules::Strict`]. `cap` must be a
+/// power of two of at least 1 KiB.
+fn decode_bounded<T: bincode::Decode>(
+    bytes: &[u8],
+    cap: usize,
+) -> Result<(T, usize), bincode::error::DecodeError> {
+    let class = claim_class(bytes.len()).map_or(cap, |c| c.min(cap));
     decode_in_class(bytes, class)
 }
+
+/// Decodes `bytes` as grovedb 3.1.0 does, for [`ProofRules::V310`], except
+/// under the claim limit [`claim_class`] gives. A decode that 3.1.0 completes
+/// claims at most 25 times the input's length, under that limit, so it
+/// decodes identically; one that claims more cannot be satisfied by the
+/// input, so 3.1.0 fails on it too (or, allocating the claim, aborts), and
+/// this returns an error instead. Past the largest class (inputs over 256 MiB
+/// on 64-bit targets) it decodes with no limit, as 3.1.0.
+fn decode_v310<T: bincode::Decode>(
+    bytes: &[u8],
+) -> Result<(T, usize), bincode::error::DecodeError> {
+    match claim_class(bytes.len()) {
+        Some(class) => decode_in_class(bytes, class),
+        None => bincode::decode_from_slice(
+            bytes,
+            bincode::config::standard()
+                .with_big_endian()
+                .with_no_limit(),
+        ),
+    }
+}
+
+/// Strict caps on a decode's claim limit: the envelope's (upstream GroveDB's
+/// bound) and an element's (the merk decoder's value cap).
+const STRICT_ENVELOPE_CLAIM_CAP: usize = 1 << 28;
+const STRICT_ELEMENT_CLAIM_CAP: usize = 1 << 26;
 
 macro_rules! decode_in_classes {
     ($bytes:expr, $class:expr, $($bits:literal)*) => {
@@ -76,7 +121,10 @@ fn decode_in_class<T: bincode::Decode>(
     bytes: &[u8],
     class: usize,
 ) -> Result<(T, usize), bincode::error::DecodeError> {
-    decode_in_classes!(bytes, class, 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33)
+    decode_in_classes!(
+        bytes, class,
+        10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33
+    )
 }
 
 #[cfg(not(target_pointer_width = "64"))]
@@ -84,25 +132,34 @@ fn decode_in_class<T: bincode::Decode>(
     bytes: &[u8],
     class: usize,
 ) -> Result<(T, usize), bincode::error::DecodeError> {
-    decode_in_classes!(bytes, class, 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+    decode_in_classes!(
+        bytes, class,
+        10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31
+    )
 }
 
 impl GroveDb {
-    /// Decodes a proof envelope. [`ProofRules::V310`] is 3.1.0's decode (no
-    /// size limit, trailing bytes ignored). [`ProofRules::Strict`] refuses an
+    /// Decodes a proof envelope. Under either rule set the envelope's nesting
+    /// is checked first, without recursion ([`envelope_depth_within`]), since
+    /// bincode decodes each level of nesting one stack frame deeper.
+    /// [`ProofRules::V310`] is then 3.1.0's decode, trailing bytes ignored,
+    /// under [`decode_v310`]'s claim limit. [`ProofRules::Strict`] refuses an
     /// envelope over [`STRICT_MAX_PROOF_BYTES`], decodes with
     /// [`decode_bounded`], and refuses trailing bytes.
     fn decode_proof_with_rules(proof: &[u8], rules: ProofRules) -> Result<GroveDBProof, Error> {
         let decode_error = |e| Error::CorruptedData(format!("unable to decode proof: {}", e));
+        let max_depth = match rules {
+            ProofRules::V310 => MAX_V310_PROOF_DEPTH,
+            ProofRules::Strict => MAX_STRICT_PROOF_DEPTH,
+        };
+        if !envelope_depth_within(proof, max_depth) {
+            return Err(Error::CorruptedData(format!(
+                "unable to decode proof: its layers nest more than {} deep",
+                max_depth
+            )));
+        }
         match rules {
-            ProofRules::V310 => {
-                let config = bincode::config::standard()
-                    .with_big_endian()
-                    .with_no_limit();
-                Ok(bincode::decode_from_slice(proof, config)
-                    .map_err(decode_error)?
-                    .0)
-            }
+            ProofRules::V310 => Ok(decode_v310(proof).map_err(decode_error)?.0),
             ProofRules::Strict => {
                 if proof.len() > STRICT_MAX_PROOF_BYTES {
                     return Err(Error::CorruptedData(format!(
@@ -111,7 +168,8 @@ impl GroveDb {
                         STRICT_MAX_PROOF_BYTES
                     )));
                 }
-                let (grovedb_proof, used) = decode_bounded(proof).map_err(decode_error)?;
+                let (grovedb_proof, used) =
+                    decode_bounded(proof, STRICT_ENVELOPE_CLAIM_CAP).map_err(decode_error)?;
                 if used != proof.len() {
                     return Err(Error::CorruptedData(format!(
                         "unable to decode proof: {} trailing bytes after the encoded proof",
@@ -123,29 +181,27 @@ impl GroveDb {
         }
     }
 
-    /// Decodes a proved element. [`ProofRules::V310`] is
-    /// [`Element::deserialize`]; [`ProofRules::Strict`] is the same decode
-    /// through [`decode_bounded`], so a node value that claims a length it
-    /// doesn't carry is refused instead of allocating it.
+    /// Decodes a proved element as [`Element::deserialize`] does, with a
+    /// claim limit: [`decode_v310`]'s under [`ProofRules::V310`] (where 3.1.0
+    /// decodes one: each element in a visited layer's result set), and
+    /// [`decode_bounded`]'s under [`ProofRules::Strict`]. A node value that
+    /// claims a length it doesn't carry is refused instead of allocated.
     fn deserialize_element(
         bytes: &[u8],
         rules: ProofRules,
         grove_version: &GroveVersion,
     ) -> Result<Element, Error> {
-        match rules {
-            ProofRules::V310 => Element::deserialize(bytes, grove_version),
-            ProofRules::Strict => {
-                check_grovedb_v0!(
-                    "Element::deserialize",
-                    grove_version.grovedb_versions.element.deserialize
-                );
-                Ok(decode_bounded(bytes)
-                    .map_err(|e| {
-                        Error::CorruptedData(format!("unable to deserialize element {}", e))
-                    })?
-                    .0)
-            }
-        }
+        check_grovedb_v0!(
+            "Element::deserialize",
+            grove_version.grovedb_versions.element.deserialize
+        );
+        let decoded = match rules {
+            ProofRules::V310 => decode_v310(bytes),
+            ProofRules::Strict => decode_bounded(bytes, STRICT_ELEMENT_CLAIM_CAP),
+        };
+        Ok(decoded
+            .map_err(|e| Error::CorruptedData(format!("unable to deserialize element {}", e)))?
+            .0)
     }
 
     /// Verifies `proof` for `query` with the given options, under
@@ -272,6 +328,9 @@ impl GroveDb {
     /// children, and none of the strict element checks run. For replaying
     /// verdicts reached with 3.1.0; anything else should call
     /// [`GroveDb::verify_query_raw`].
+    ///
+    /// It differs from 3.1.0 only where 3.1.0 can abort the process, as
+    /// [`GroveDb::verify_query_v310`] does.
     pub fn verify_query_raw_v310(
         proof: &[u8],
         query: &PathQuery,
@@ -683,6 +742,30 @@ impl GroveDb {
                             break;
                         }
                     } else {
+                        // A subquery applies to the key and the proof has no
+                        // layer below it. For a tree with a root key, 3.1.0
+                        // skips the key silently, so a prover could drop
+                        // every row under it (or present an item as such a
+                        // tree) at the honest root; strict refuses it.
+                        if rules == ProofRules::Strict
+                            && matches!(
+                                element,
+                                Element::Tree(Some(_), _)
+                                    | Element::SumTree(Some(_), ..)
+                                    | Element::BigSumTree(Some(_), ..)
+                                    | Element::CountTree(Some(_), ..)
+                                    | Element::CountSumTree(Some(_), ..)
+                            )
+                        {
+                            return Err(Error::InvalidProof(
+                                query.clone(),
+                                format!(
+                                    "Proof has no lower layer for the non-empty tree at key {}, \
+                                     which the query's subquery descends",
+                                    hex::encode(key)
+                                ),
+                            ));
+                        }
                         #[cfg(feature = "proof_debug")]
                         {
                             println!(
@@ -886,10 +969,16 @@ impl GroveDb {
     /// - refuses an unresolved `Reference` element among the proved elements;
     /// - on `query.path`, refuses a non-tree element, a non-empty tree with no
     ///   lower layer, and an empty tree not bound to its value hash;
+    /// - below `query.path`, refuses a tree with a root key that a subquery
+    ///   descends but that has no lower layer. This refuses some honest limited
+    ///   subquery proofs from 3.1.0's prover, whose limit accounting differs
+    ///   from the verifier's (it stops early), and every subquery into a
+    ///   non-empty `CountSumTree` (its prover never descends one);
     /// - decodes the envelope and each element with a claim bound of about 32
-    ///   times its length (where 3.1.0, unbounded, aborts the process on a
-    ///   lying length), refuses an envelope over 256 MiB, and refuses trailing
-    ///   bytes after the envelope.
+    ///   times its length (capped at 256 MiB and 64 MiB; where 3.1.0,
+    ///   unbounded, aborts the process on a lying length), refuses an envelope
+    ///   over 256 MiB or nested more than [`MAX_STRICT_PROOF_DEPTH`] deep, and
+    ///   refuses trailing bytes after the envelope.
     ///
     /// Not bound, by either rule set: the bytes of a tree element with a root
     /// key returned as a result with no lower layer (3.1.0's proof format
@@ -909,6 +998,10 @@ impl GroveDb {
     /// children, and none of the strict element checks run. For replaying
     /// verdicts reached with 3.1.0; anything else should call
     /// [`GroveDb::verify_query`].
+    ///
+    /// It differs from 3.1.0 only where 3.1.0 can abort the process: an
+    /// envelope nested more than [`MAX_V310_PROOF_DEPTH`] deep, and a length
+    /// claim no input could satisfy (see [`decode_v310`]), are errors here.
     pub fn verify_query_v310(
         proof: &[u8],
         query: &PathQuery,

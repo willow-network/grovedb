@@ -23,6 +23,84 @@ use crate::{
     Error, GroveDb, PathQuery,
 };
 
+/// The deepest the strict verification entry points let a proof's layers
+/// nest below its root layer. A GroveDB path is a handful of segments.
+pub const MAX_STRICT_PROOF_DEPTH: usize = 64;
+
+/// The deepest the `_v310` verification entry points let a proof's layers nest
+/// below its root layer. bincode decodes each level of `LayerProof` nesting one
+/// level deeper on the stack: grovedb 3.1.0 decodes 3,000 levels on a 2 MiB
+/// thread stack (as tendermint-abci's connection threads have) and dies of a
+/// stack overflow at 6,000. Refusing a deeper envelope changes 3.1.0's verdict
+/// only at depths where 3.1.0 itself could abort the process.
+pub const MAX_V310_PROOF_DEPTH: usize = 3_000;
+
+/// Whether the serialized `GroveDBProof` in `bytes` nests its layers at most
+/// `max_depth` below its root layer (a proof with no lower layers has depth
+/// 0).
+///
+/// It walks the bincode encoding (standard, big-endian, varint lengths: the
+/// `V0` tag, then each `LayerProof` as its `merk_proof` byte string, its
+/// `lower_layers` map length, and each entry's key byte string and
+/// `LayerProof`) iteratively, with memory proportional to the depth reached,
+/// so it can run before a decoder whose recursion a deep envelope would
+/// overflow. Input it can't parse returns `true`: the decoder reads the same
+/// bytes in the same order, so it fails at or before the depth the walk
+/// reached.
+pub fn envelope_depth_within(bytes: &[u8], max_depth: usize) -> bool {
+    fn varint(bytes: &[u8], pos: &mut usize) -> Option<u64> {
+        let first = *bytes.get(*pos)?;
+        *pos += 1;
+        let width = match first {
+            0..=250 => return Some(first as u64),
+            251 => 2,
+            252 => 4,
+            253 => 8,
+            _ => return None,
+        };
+        let wide = bytes.get(*pos..pos.checked_add(width)?)?;
+        *pos += width;
+        Some(wide.iter().fold(0, |acc, b| (acc << 8) | *b as u64))
+    }
+    fn skip_byte_string(bytes: &[u8], pos: &mut usize) -> Option<()> {
+        let len = usize::try_from(varint(bytes, pos)?).ok()?;
+        *pos = pos.checked_add(len).filter(|end| *end <= bytes.len())?;
+        Some(())
+    }
+    fn walk(bytes: &[u8], max_depth: usize) -> Option<bool> {
+        let mut pos = 0;
+        if varint(bytes, &mut pos)? != 0 {
+            return None; // not V0: the decoder fails at the tag
+        }
+        // For each open lower-layer map, the entries it has left; the map at
+        // index i holds the layers at depth i + 1.
+        let mut open: Vec<u64> = Vec::new();
+        skip_byte_string(bytes, &mut pos)?;
+        let entries = varint(bytes, &mut pos)?;
+        if entries > 0 {
+            open.push(entries);
+        }
+        while let Some(left) = open.last_mut() {
+            if *left == 0 {
+                open.pop();
+                continue;
+            }
+            *left -= 1;
+            if open.len() > max_depth {
+                return Some(false);
+            }
+            skip_byte_string(bytes, &mut pos)?; // the key
+            skip_byte_string(bytes, &mut pos)?; // the layer's merk proof
+            let entries = varint(bytes, &mut pos)?;
+            if entries > 0 {
+                open.push(entries);
+            }
+        }
+        Some(true)
+    }
+    walk(bytes, max_depth).unwrap_or(true)
+}
+
 #[derive(Debug, Clone, Copy, Encode, Decode)]
 pub struct ProveOptions {
     /// This tells the proof system to decrease the available limit of the query

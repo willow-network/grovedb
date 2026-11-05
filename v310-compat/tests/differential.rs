@@ -254,15 +254,16 @@ fn dbg<T: Debug>(t: &T) -> String {
     format!("{t:?}")
 }
 
-static SKIPPED_ABORTING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ABORTING_REFUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static LIMIT_REFUSALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// Whether 3.1.0's unbounded bincode decoding can run on `bytes` without
 /// trying to allocate a lying length. 3.1.0 decodes the envelope and each
 /// element with no size limit and resizes a byte string to its claimed length
-/// before reading it, so such an input aborts the process (in 3.1.0 and in the
-/// fork's `_v310` path alike); it cannot be compared, only avoided. Decoding is
-/// deterministic, so an input that a bounded decode refuses for another reason
-/// fails identically, with no large allocation, unbounded.
+/// before reading it, so such an input can abort the process: it is not run
+/// through 3.1.0, and the fork's `_v310` path must return an error for it.
+/// Decoding is deterministic, so an input that a bounded decode refuses for
+/// another reason fails identically, with no large allocation, unbounded.
 fn safe_for_unbounded_decoders(bytes: &[u8]) -> bool {
     use bincode::error::DecodeError::LimitExceeded;
     let cfg = bincode::config::standard()
@@ -299,9 +300,29 @@ fn safe_for_unbounded_decoders(bytes: &[u8]) -> bool {
 /// Legacy (fork `_v310`) vs 3.1.0 on the same bytes. Returns whether 3.1.0
 /// accepted.
 fn assert_legacy_matches(proof: &[u8], pq: &PathQuery, what: &str) -> bool {
+    let fork_a = || {
+        GroveDb::verify_query_with_options_and_rules(
+            proof,
+            pq,
+            absence_options(),
+            grovedb::ProofRules::V310,
+            fv(),
+        )
+    };
     if !safe_for_unbounded_decoders(proof) {
-        SKIPPED_ABORTING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Strict decodes it with bounds, so it returns rather than aborting.
+        ABORTING_REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 3.1.0 would allocate the lying length; the fork's _v310 refuses it.
+        assert!(
+            GroveDb::verify_query_v310(proof, pq, fv()).is_err(),
+            "{what}"
+        );
+        assert!(
+            GroveDb::verify_query_raw_v310(proof, pq, fv()).is_err(),
+            "{what}"
+        );
+        if pq.query.limit.is_some() {
+            assert!(fork_a().is_err(), "{what}");
+        }
         let _ = GroveDb::verify_query(proof, pq, fv());
         let _ = GroveDb::verify_query_raw(proof, pq, fv());
         return false;
@@ -309,26 +330,34 @@ fn assert_legacy_matches(proof: &[u8], pq: &PathQuery, what: &str) -> bool {
     let bpq = base_query(pq);
     let fork_q = GroveDb::verify_query_v310(proof, pq, fv());
     let base_q = grovedb_v310::GroveDb::verify_query(proof, &bpq, bv());
-    assert_eq!(dbg(&fork_q), dbg(&base_q), "verify_query differs: {what}");
+    same_verdict(&fork_q, &base_q, "verify_query", what);
     let fork_r = GroveDb::verify_query_raw_v310(proof, pq, fv());
     let base_r = grovedb_v310::GroveDb::verify_query_raw(proof, &bpq, bv());
-    assert_eq!(
-        dbg(&fork_r),
-        dbg(&base_r),
-        "verify_query_raw differs: {what}"
-    );
+    same_verdict(&fork_r, &base_r, "verify_query_raw", what);
     if pq.query.limit.is_some() {
-        let fork_a = GroveDb::verify_query_with_options_and_rules(
-            proof,
-            pq,
-            absence_options(),
-            grovedb::ProofRules::V310,
-            fv(),
-        );
         let base_a = grovedb_v310::GroveDb::verify_query_with_absence_proof(proof, &bpq, bv());
-        assert_eq!(dbg(&fork_a), dbg(&base_a), "absence proof differs: {what}");
+        same_verdict(&fork_a(), &base_a, "absence proof", what);
     }
     base_q.is_ok()
+}
+
+/// The fork's `_v310` result matches 3.1.0's exactly (`Debug`: Ok/Err, root,
+/// rows, error text), except that where the fork's bounded decode refused a
+/// length claim the input couldn't satisfy (`LimitExceeded`), 3.1.0 must have
+/// failed too, on the same input, after allocating the claim.
+fn same_verdict<A: Debug, B: Debug, E1: Debug, E2: Debug>(
+    fork: &Result<A, E1>,
+    base: &Result<B, E2>,
+    which: &str,
+    what: &str,
+) {
+    if let (Err(f), Err(_)) = (fork, base) {
+        if dbg(f).contains("LimitExceeded") {
+            LIMIT_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
+    }
+    assert_eq!(dbg(fork), dbg(base), "{which} differs: {what}");
 }
 
 fn absence_options() -> grovedb::VerifyOptions {
@@ -530,10 +559,12 @@ fn same_state_same_proofs_same_legacy_verdicts() {
     }
     println!(
         "honest proofs: {honest_count} (byte-identical to 3.1.0); mutations: {mutation_count} \
-         (3.1.0 accepted {base_accepted_mutations}); garbage inputs: {}; skipped as aborting \
-         3.1.0 (all tests so far): {}",
+         (3.1.0 accepted {base_accepted_mutations}); garbage inputs: {}; inputs that could abort \
+         3.1.0, refused by _v310 (all tests so far): {}; both Err, the fork's by its claim limit: \
+         {}",
         garbage().len(),
-        SKIPPED_ABORTING.load(std::sync::atomic::Ordering::Relaxed)
+        ABORTING_REFUSED.load(std::sync::atomic::Ordering::Relaxed),
+        LIMIT_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
     );
 }
 
@@ -1075,5 +1106,72 @@ fn sdk_large_value_fixtures() {
             );
             std::fs::write(format!("{dir}/{name}.json"), json).unwrap();
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Nesting depth
+// ---------------------------------------------------------------------------
+
+fn nested_envelope(depth: usize) -> Vec<u8> {
+    let mut proof = vec![0x00, 0x00, 0x01];
+    for _ in 1..depth {
+        proof.extend_from_slice(&[0x00, 0x00, 0x01]);
+    }
+    proof.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    proof
+}
+
+fn on_stack<T: Send + 'static>(bytes: usize, f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(bytes)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+/// At the `_v310` depth limit the fork verifies exactly as 3.1.0 (both on a
+/// stack big enough for 3.1.0's recursion); one deeper, the fork refuses
+/// without recursing (on a 256 KiB stack) where 3.1.0 might overflow.
+#[test]
+fn deep_nesting_v310_matches_v310_up_to_its_limit() {
+    use grovedb::operations::proof::{
+        envelope_depth_within, MAX_STRICT_PROOF_DEPTH, MAX_V310_PROOF_DEPTH,
+    };
+    for depth in [1, 2, 63, 64, 65, 1_000, MAX_V310_PROOF_DEPTH] {
+        let (fork, base) = on_stack(256 << 20, move || {
+            let proof = nested_envelope(depth);
+            let mut keys = Query::new();
+            keys.insert_key(b"k".to_vec());
+            let pq = PathQuery::new(vec![], SizedQuery::new(keys, Some(3), None));
+            let bpq = base_query(&pq);
+            (
+                [
+                    dbg(&GroveDb::verify_query_v310(&proof, &pq, fv())),
+                    dbg(&GroveDb::verify_query_raw_v310(&proof, &pq, fv())),
+                ],
+                [
+                    dbg(&grovedb_v310::GroveDb::verify_query(&proof, &bpq, bv())),
+                    dbg(&grovedb_v310::GroveDb::verify_query_raw(&proof, &bpq, bv())),
+                ],
+            )
+        });
+        assert_eq!(fork, base, "depth {depth}");
+        assert!(envelope_depth_within(&nested_envelope(depth), depth));
+    }
+    let refused = on_stack(256 << 10, || {
+        let pq = PathQuery::new_unsized(vec![], Query::new_single_key(b"k".to_vec()));
+        let legacy = nested_envelope(MAX_V310_PROOF_DEPTH + 1);
+        let strict = nested_envelope(MAX_STRICT_PROOF_DEPTH + 1);
+        [
+            dbg(&GroveDb::verify_query_v310(&legacy, &pq, fv())),
+            dbg(&GroveDb::verify_query_raw_v310(&legacy, &pq, fv())),
+            dbg(&GroveDb::verify_query(&strict, &pq, fv())),
+            dbg(&GroveDb::verify_query_raw(&strict, &pq, fv())),
+        ]
+    });
+    for r in refused {
+        assert!(r.contains("nest more than"), "{r}");
     }
 }

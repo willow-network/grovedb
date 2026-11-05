@@ -38,6 +38,8 @@ pub enum ProofRules {
     Strict,
     /// Exactly grovedb / grovedb-merk 3.1.0: large-value opcodes are unknown
     /// opcodes, `Hash` nodes may take children, and no element checks run.
+    /// (At the GroveDB layer, inputs on which 3.1.0 aborts the process, a
+    /// too-deep envelope or an unsatisfiable length claim, are errors.)
     V310,
 }
 

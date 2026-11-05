@@ -1242,3 +1242,214 @@ fn honest_proofs_claiming_more_than_their_length_still_verify() {
         .any(unresolved));
     assert_eq!(assert_honest(&db, &pq, v).len(), 2);
 }
+
+// -------------------------------------------------------------------------
+// Nesting depth, checked without recursion (review finding)
+// -------------------------------------------------------------------------
+
+/// A V0 envelope whose layers nest `depth` (at least 1) deep: the root layer
+/// and each level carry no ops and one lower layer under an empty key; the
+/// deepest has none; then the prove options.
+fn nested_envelope(depth: usize) -> Vec<u8> {
+    let mut proof = vec![0x00, 0x00, 0x01];
+    for _ in 1..depth {
+        proof.extend_from_slice(&[0x00, 0x00, 0x01]);
+    }
+    proof.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+    proof
+}
+
+fn on_small_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    std::thread::Builder::new()
+        .stack_size(256 << 10)
+        .spawn(f)
+        .unwrap()
+        .join()
+        .unwrap()
+}
+
+#[test]
+fn envelope_depth_walk() {
+    use crate::operations::proof::{
+        envelope_depth_within, MAX_STRICT_PROOF_DEPTH, MAX_V310_PROOF_DEPTH,
+    };
+    for depth in [1, 2, 64, 65, 3_000, 3_001] {
+        let p = nested_envelope(depth);
+        assert!(envelope_depth_within(&p, depth), "{depth}");
+        assert!(!envelope_depth_within(&p, depth - 1), "{depth}");
+    }
+    assert!(envelope_depth_within(
+        &nested_envelope(MAX_STRICT_PROOF_DEPTH),
+        MAX_STRICT_PROOF_DEPTH
+    ));
+    assert!(envelope_depth_within(
+        &nested_envelope(MAX_V310_PROOF_DEPTH),
+        MAX_V310_PROOF_DEPTH
+    ));
+    // Input the walk can't parse is left to the decoder.
+    for bad in [
+        &[][..],
+        &[0x01],
+        &[0x00, 0xFD],
+        &[0x00, 0x05, 1, 2],
+        &[0x00, 0x00, 0xFF],
+    ] {
+        assert!(envelope_depth_within(bad, 0), "{bad:?}");
+    }
+    // An honest proof nests exactly as deep as its path.
+    let v = GroveVersion::latest();
+    let db = db_with_subtree(v);
+    let proof = db.prove_query(&sub_query(), None, v).unwrap().unwrap();
+    assert!(envelope_depth_within(&proof, 2));
+    assert!(!envelope_depth_within(&proof, 1));
+}
+
+#[test]
+fn too_deep_envelopes_are_refused_without_recursion() {
+    use crate::operations::proof::{MAX_STRICT_PROOF_DEPTH, MAX_V310_PROOF_DEPTH};
+    // On a 256 KiB stack, far less than decoding thousands of levels needs.
+    let results = on_small_stack(|| {
+        let v = GroveVersion::latest();
+        let pq = PathQuery::new_unsized(vec![], Query::new_single_key(b"k".to_vec()));
+        let strict = nested_envelope(MAX_STRICT_PROOF_DEPTH + 1);
+        let legacy = nested_envelope(MAX_V310_PROOF_DEPTH + 1);
+        vec![
+            GroveDb::verify_query(&strict, &pq, v).map(|_| ()),
+            GroveDb::verify_query_raw(&strict, &pq, v).map(|_| ()),
+            GroveDb::verify_query_v310(&legacy, &pq, v).map(|_| ()),
+            GroveDb::verify_query_raw_v310(&legacy, &pq, v).map(|_| ()),
+            GroveDb::verify_query(&nested_envelope(1_000_000), &pq, v).map(|_| ()),
+        ]
+    });
+    for r in results {
+        assert!(
+            matches!(r, Err(Error::CorruptedData(ref m)) if m.contains("nest more than")),
+            "{r:?}"
+        );
+    }
+    // At the strict limit the envelope decodes (its empty merk proof then fails).
+    let v = GroveVersion::latest();
+    let pq = PathQuery::new_unsized(vec![], Query::new_single_key(b"k".to_vec()));
+    let r = GroveDb::verify_query(&nested_envelope(MAX_STRICT_PROOF_DEPTH), &pq, v);
+    assert!(
+        !matches!(r, Err(Error::CorruptedData(ref m)) if m.contains("nest more than")),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn lying_lengths_return_errors_under_v310() {
+    let v = GroveVersion::latest();
+    let pq = PathQuery::new_unsized(vec![], Query::new_single_key(b"k".to_vec()));
+    // 3.1.0 allocates these claims (and aborts when it can't); _v310 refuses.
+    let mut envelope = vec![0x00, 0xFD];
+    envelope.extend_from_slice(&(1u64 << 62).to_be_bytes());
+    let mut item = vec![0x00, 0xFD];
+    item.extend_from_slice(&(1u64 << 62).to_be_bytes());
+    let in_a_row = encode_proof(GroveDBProofV0 {
+        root_layer: LayerProof {
+            merk_proof: encode_ops(&[Op::Push(Node::KV(b"k".to_vec(), item))]),
+            lower_layers: Default::default(),
+        },
+        prove_options: Default::default(),
+    });
+    for proof in [envelope, in_a_row] {
+        let r = GroveDb::verify_query_v310(&proof, &pq, v);
+        assert!(
+            matches!(r, Err(Error::CorruptedData(ref m)) if m.contains("LimitExceeded")),
+            "{r:?}"
+        );
+        assert!(GroveDb::verify_query_raw_v310(&proof, &pq, v).is_err());
+    }
+}
+
+// -------------------------------------------------------------------------
+// A subquery descends a non-empty tree with no lower layer (review finding)
+// -------------------------------------------------------------------------
+
+#[test]
+fn rows_dropped_under_a_subquery_are_refused() {
+    let v = GroveVersion::latest();
+    let db = make_test_grovedb(v);
+    for i in 0..10u8 {
+        let k = format!("k{i:02}");
+        db.insert(
+            [TEST_LEAF].as_ref(),
+            k.as_bytes(),
+            Element::new_item(vec![i; 10]),
+            None,
+            None,
+            v,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    db.insert(
+        [TEST_LEAF].as_ref(),
+        b"inner",
+        Element::empty_tree(),
+        None,
+        None,
+        v,
+    )
+    .unwrap()
+    .unwrap();
+    for i in 1..=5u8 {
+        db.insert(
+            [TEST_LEAF, b"inner"].as_ref(),
+            &[b'i', b'0' + i],
+            Element::new_item(vec![i]),
+            None,
+            None,
+            v,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    let root = root_hash(&db, v);
+    let mut q = Query::new_range_full();
+    q.set_subquery(Query::new_range_full());
+    let pq = PathQuery::new_unsized(vec![TEST_LEAF.to_vec()], q);
+    let honest = assert_honest(&db, &pq, v);
+    assert_eq!(honest.len(), 15);
+    let proof = db.prove_query(&pq, None, v).unwrap().unwrap();
+
+    // A: an item presented as a non-empty tree, with no layer below it.
+    for tree in [
+        Element::new_tree(Some(b"zz".to_vec())),
+        Element::new_count_sum_tree(Some(b"zz".to_vec())),
+    ] {
+        let bytes = tree.serialize(v).unwrap();
+        let forged = replace_node(&proof, &[TEST_LEAF], b"k05", |n| match n {
+            Node::KV(k, value) => {
+                Node::KVValueHash(k.clone(), bytes.clone(), value_hash(value).unwrap())
+            }
+            other => panic!("{other:?}"),
+        });
+        let (r, rows) = GroveDb::verify_query_v310(&forged, &pq, v).expect("3.1.0 accepts");
+        assert_eq!((r, rows.len()), (root, 14));
+        assert_strict_refuses(&forged, &pq, v, "no lower layer for the non-empty tree");
+    }
+
+    // B: a subtree's honest lower layer dropped.
+    let mut v0 = decode_proof(&proof);
+    layer(&mut v0.root_layer, &[TEST_LEAF])
+        .lower_layers
+        .remove(b"inner".as_slice())
+        .unwrap();
+    let forged = encode_proof(v0);
+    let (r, rows) = GroveDb::verify_query_v310(&forged, &pq, v).expect("3.1.0 accepts");
+    assert_eq!((r, rows.len()), (root, 10));
+    assert_strict_refuses(&forged, &pq, v, "no lower layer for the non-empty tree");
+}
+
+/// The claim bound's premise (see `claim_class` in proof/verify.rs): the
+/// containers a proof envelope or an element decodes claim at most 24 bytes
+/// in memory per serialized byte. A `Vec<Vec<u8>>` segment serializes in at
+/// least 1 byte, a lower-layer map entry in at least 3.
+#[test]
+fn decoded_containers_claim_at_most_24_bytes_per_serialized_byte() {
+    use std::mem::size_of;
+    assert!(size_of::<Vec<u8>>() <= 24);
+    assert!(size_of::<(Vec<u8>, LayerProof)>() <= 3 * 24);
+}
