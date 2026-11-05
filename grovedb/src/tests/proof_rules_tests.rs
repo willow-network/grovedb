@@ -913,3 +913,332 @@ fn lying_lengths_and_trailing_bytes_are_refused_strictly() {
         Err(Error::CorruptedData(ref m)) if m.contains("trailing bytes")
     ));
 }
+
+// -------------------------------------------------------------------------
+// An item presented as an empty tree, at result positions (review finding)
+// -------------------------------------------------------------------------
+
+fn as_empty_tree(proof: &[u8], path: &[&[u8]], key: &[u8], v: &GroveVersion) -> Vec<u8> {
+    let empty = Element::empty_tree().serialize(v).unwrap();
+    replace_node(proof, path, key, |n| match n {
+        Node::KV(k, value) => {
+            Node::KVValueHash(k.clone(), empty.clone(), value_hash(value).unwrap())
+        }
+        other => panic!("expected KV, got {other:?}"),
+    })
+}
+
+#[test]
+fn item_presented_as_an_empty_tree_is_refused_at_result_positions() {
+    let v = GroveVersion::latest();
+    let db = make_test_grovedb(v);
+    for i in 0..10u8 {
+        let k = format!("k{i:02}");
+        db.insert(
+            [TEST_LEAF].as_ref(),
+            k.as_bytes(),
+            Element::new_item(vec![i; 10]),
+            None,
+            None,
+            v,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    db.insert(
+        [TEST_LEAF].as_ref(),
+        b"a",
+        Element::empty_tree(),
+        None,
+        None,
+        v,
+    )
+    .unwrap()
+    .unwrap();
+    db.insert(
+        [TEST_LEAF, b"a"].as_ref(),
+        b"b",
+        Element::empty_tree(),
+        None,
+        None,
+        v,
+    )
+    .unwrap()
+    .unwrap();
+    db.insert(
+        [TEST_LEAF, b"a", b"b"].as_ref(),
+        b"key",
+        Element::new_item(b"v".to_vec()),
+        None,
+        None,
+        v,
+    )
+    .unwrap()
+    .unwrap();
+    let root = root_hash(&db, v);
+
+    // A single key at depth 1, with a limit (so also an absence proof).
+    let pq = PathQuery::new(
+        vec![TEST_LEAF.to_vec()],
+        SizedQuery::new(Query::new_single_key(b"k03".to_vec()), Some(1), None),
+    );
+    let proof = db.prove_query(&pq, None, v).unwrap().unwrap();
+    let forged = as_empty_tree(&proof, &[TEST_LEAF], b"k03", v);
+    let (r, rows) = GroveDb::verify_query_v310(&forged, &pq, v).expect("3.1.0 accepts");
+    assert_eq!((r, rows.len()), (root, 0));
+    let (_, absent) = GroveDb::verify_query_with_options_and_rules(
+        &forged,
+        &pq,
+        grovedb_merk::proofs::query::VerifyOptions {
+            absence_proofs_for_non_existing_searched_keys: true,
+            verify_proof_succinctness: true,
+            include_empty_trees_in_result: false,
+        },
+        crate::ProofRules::V310,
+        v,
+    )
+    .unwrap();
+    assert_eq!(
+        item_values(&absent),
+        vec![None],
+        "3.1.0 proves a present key absent"
+    );
+    assert_strict_refuses(&forged, &pq, v, "empty tree element not bound");
+    assert!(GroveDb::verify_query_with_absence_proof(&forged, &pq, v).is_err());
+
+    // A single key at depth 3 (the [subgroves, id, data]/key shape).
+    let pq3 = PathQuery::new_unsized(
+        vec![TEST_LEAF.to_vec(), b"a".to_vec(), b"b".to_vec()],
+        Query::new_single_key(b"key".to_vec()),
+    );
+    let proof3 = db.prove_query(&pq3, None, v).unwrap().unwrap();
+    let forged3 = as_empty_tree(&proof3, &[TEST_LEAF, b"a", b"b"], b"key", v);
+    let (r, rows) = GroveDb::verify_query_v310(&forged3, &pq3, v).expect("3.1.0 accepts");
+    assert_eq!((r, rows.len()), (root, 0));
+    assert_strict_refuses(&forged3, &pq3, v, "empty tree element not bound");
+
+    // A range that silently loses a row.
+    let mut q = Query::new();
+    q.insert_range(b"k02".to_vec()..b"k09".to_vec());
+    let pqr = PathQuery::new_unsized(vec![TEST_LEAF.to_vec()], q);
+    let proofr = db.prove_query(&pqr, None, v).unwrap().unwrap();
+    let honest = assert_honest(&db, &pqr, v);
+    assert_eq!(honest.len(), 7);
+    let forgedr = as_empty_tree(&proofr, &[TEST_LEAF], b"k05", v);
+    let (r, rows) = GroveDb::verify_query_v310(&forgedr, &pqr, v).expect("3.1.0 accepts");
+    assert_eq!((r, rows.len()), (root, 6));
+    assert_strict_refuses(&forgedr, &pqr, v, "empty tree element not bound");
+}
+
+#[test]
+fn honest_empty_trees_as_result_rows_verify_strictly() {
+    let v = GroveVersion::latest();
+    let db = make_test_grovedb(v);
+    for (k, e) in [
+        (b"e1".as_slice(), Element::empty_tree()),
+        (b"e2".as_slice(), Element::empty_sum_tree()),
+        (b"e3".as_slice(), Element::empty_big_sum_tree()),
+        (b"e4".as_slice(), Element::empty_count_tree()),
+        (b"i1".as_slice(), Element::new_item(b"x".to_vec())),
+    ] {
+        db.insert([TEST_LEAF].as_ref(), k, e, None, None, v)
+            .unwrap()
+            .unwrap();
+    }
+    let pq = PathQuery::new_unsized(vec![TEST_LEAF.to_vec()], Query::new_range_full());
+    assert_honest(&db, &pq, v);
+    let proof = db.prove_query(&pq, None, v).unwrap().unwrap();
+    let (_, raw) = GroveDb::verify_query_raw(&proof, &pq, v).unwrap();
+    assert_eq!(raw.len(), 5, "raw rows include the empty trees");
+    let pq = PathQuery::new_unsized(
+        vec![TEST_LEAF.to_vec()],
+        Query::new_single_key(b"e2".to_vec()),
+    );
+    assert_honest(&db, &pq, v);
+}
+
+#[test]
+fn tree_element_under_the_plain_hash_of_its_bytes_is_refused() {
+    let v = GroveVersion::latest();
+    let db = make_test_grovedb(v);
+    // At the root layer, so no parent hash check catches the change first.
+    db.insert(
+        EMPTY_PATH,
+        b"k",
+        Element::new_item(b"v".to_vec()),
+        None,
+        None,
+        v,
+    )
+    .unwrap()
+    .unwrap();
+    let pq = PathQuery::new_unsized(vec![], Query::new_single_key(b"k".to_vec()));
+    let proof = db.prove_query(&pq, None, v).unwrap().unwrap();
+    let tree_bytes = Element::empty_tree().serialize(v).unwrap();
+    // A KV node carrying a tree's bytes: the root moves (only a 63-byte
+    // collision would keep it), but strict refuses the shape outright.
+    let forged = replace_node(&proof, &[], b"k", |n| match n {
+        Node::KV(k, _) => Node::KV(k.clone(), tree_bytes.clone()),
+        other => panic!("{other:?}"),
+    });
+    let (root, _) = GroveDb::verify_query_raw_v310(&forged, &pq, v).expect("3.1.0 accepts");
+    assert_ne!(root, root_hash(&db, v));
+    let raw = GroveDb::verify_query_raw(&forged, &pq, v);
+    assert!(
+        matches!(raw, Err(Error::InvalidProof(_, ref m)) if m.contains("plain hash")),
+        "{raw:?}"
+    );
+}
+
+// -------------------------------------------------------------------------
+// Decode bounds proportional to the input (review finding)
+// -------------------------------------------------------------------------
+
+fn bomb_proof(nodes: usize) -> Vec<u8> {
+    // Item tag 0x00, then a bincode varint claiming a 67,108,863-byte Vec<u8>.
+    let bomb = vec![0x00u8, 0xFC, 0x03, 0xF0, 0x00, 0x00];
+    let ops: Vec<Op> = (0..nodes as u32)
+        .map(|i| {
+            Op::Push(Node::KVValueHash(
+                i.to_be_bytes().to_vec(),
+                bomb.clone(),
+                [0; 32],
+            ))
+        })
+        .collect();
+    encode_proof(GroveDBProofV0 {
+        root_layer: LayerProof {
+            merk_proof: encode_ops(&ops),
+            lower_layers: Default::default(),
+        },
+        prove_options: Default::default(),
+    })
+}
+
+#[test]
+fn lying_element_lengths_are_refused_without_large_allocations() {
+    let v = GroveVersion::latest();
+    let pq = PathQuery::new_unsized(vec![], Query::new_single_key(vec![0xff; 5]));
+    for n in [1usize, 50] {
+        let proof = bomb_proof(n);
+        let t = std::time::Instant::now();
+        let r = GroveDb::verify_query(&proof, &pq, v);
+        let elapsed = t.elapsed();
+        assert!(
+            matches!(r, Err(Error::InvalidProof(_, ref m)) if m.contains("not an element")),
+            "{r:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "{n} nodes: {elapsed:?}"
+        );
+    }
+    // A ten-byte envelope claiming a 2 GiB merk proof.
+    let mut env = vec![0x00, 0xFC];
+    env.extend_from_slice(&0x7FFF_FFFFu32.to_be_bytes());
+    env.extend_from_slice(&[0; 4]);
+    let t = std::time::Instant::now();
+    let r = GroveDb::verify_query(&env, &pq, v);
+    assert!(
+        matches!(r, Err(Error::CorruptedData(ref m)) if m.contains("unable to decode proof")),
+        "{r:?}"
+    );
+    assert!(t.elapsed() < std::time::Duration::from_secs(1));
+}
+
+#[test]
+fn honest_proofs_claiming_more_than_their_length_still_verify() {
+    let v = GroveVersion::latest();
+    let db = make_test_grovedb(v);
+    // Many small lower layers in one map.
+    for i in 0..300u16 {
+        let k = i.to_be_bytes();
+        db.insert(
+            [TEST_LEAF].as_ref(),
+            &k,
+            Element::empty_tree(),
+            None,
+            None,
+            v,
+        )
+        .unwrap()
+        .unwrap();
+        db.insert(
+            [TEST_LEAF, k.as_slice()].as_ref(),
+            b"x",
+            Element::new_item(vec![1]),
+            None,
+            None,
+            v,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    let mut q = Query::new_range_full();
+    q.set_subquery(Query::new_range_full());
+    let pq = PathQuery::new_unsized(vec![TEST_LEAF.to_vec()], q);
+    assert_eq!(assert_honest(&db, &pq, v).len(), 300);
+
+    // A reference with a 101-segment path, left unresolved in a KVValueHash
+    // node once the limit is spent, which strict still decodes.
+    let mut path: Vec<Vec<u8>> = vec![b"deep".to_vec()];
+    db.insert(EMPTY_PATH, b"deep", Element::empty_tree(), None, None, v)
+        .unwrap()
+        .unwrap();
+    for i in 0..99u8 {
+        let p: Vec<&[u8]> = path.iter().map(|s| s.as_slice()).collect();
+        db.insert(p.as_slice(), &[i], Element::empty_tree(), None, None, v)
+            .unwrap()
+            .unwrap();
+        path.push(vec![i]);
+    }
+    let p: Vec<&[u8]> = path.iter().map(|s| s.as_slice()).collect();
+    db.insert(
+        p.as_slice(),
+        b"it",
+        Element::new_item(b"end".to_vec()),
+        None,
+        None,
+        v,
+    )
+    .unwrap()
+    .unwrap();
+    path.push(b"it".to_vec());
+    let reference = Element::new_reference(ReferencePathType::AbsolutePathReference(path));
+    let ref_bytes = reference.serialize(v).unwrap();
+    // 101 segments claim 101 * 24 bytes up front: more than a bound of twice
+    // the element's length, even with a 1 KiB floor, would allow.
+    assert!(101 * 24 > (2 * ref_bytes.len()).next_power_of_two().max(1024) * 2);
+    db.insert(EMPTY_PATH, b"zz_ref", reference, None, None, v)
+        .unwrap()
+        .unwrap();
+    db.insert(EMPTY_PATH, b"a_tree", Element::empty_tree(), None, None, v)
+        .unwrap()
+        .unwrap();
+    for k in [b"1", b"2"] {
+        db.insert(
+            [b"a_tree".as_slice()].as_ref(),
+            k,
+            Element::new_item(vec![2]),
+            None,
+            None,
+            v,
+        )
+        .unwrap()
+        .unwrap();
+    }
+    let mut q = Query::new();
+    q.insert_key(b"a_tree".to_vec());
+    q.insert_key(b"zz_ref".to_vec());
+    q.set_subquery(Query::new_range_full());
+    let pq = PathQuery::new(vec![], SizedQuery::new(q, Some(2), None));
+    let proof = db.prove_query(&pq, None, v).unwrap().unwrap();
+    let unresolved = |op: &Op| match op {
+        Op::Push(Node::KVValueHash(k, value, _)) => k == b"zz_ref" && value == &ref_bytes,
+        _ => false,
+    };
+    assert!(ops(&decode_proof(&proof).root_layer.merk_proof)
+        .iter()
+        .any(unresolved));
+    assert_eq!(assert_honest(&db, &pq, v).len(), 2);
+}

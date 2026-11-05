@@ -25,21 +25,73 @@ use crate::{
     Element, Error, GroveDb, PathQuery,
 };
 
-/// Under [`ProofRules::Strict`], at most this many bytes may be claimed while
-/// decoding a proof envelope (upstream GroveDB's bound). grovedb 3.1.0 decodes
-/// with no limit: bincode allocates a byte string at its claimed length before
-/// reading it, so a few bytes claiming an enormous length abort the process.
-const STRICT_PROOF_DECODE_LIMIT: usize = 256 * 1024 * 1024;
+/// The longest proof envelope strict verification decodes (upstream GroveDB's
+/// bound).
+const STRICT_MAX_PROOF_BYTES: usize = 256 * 1024 * 1024;
 
-/// Under [`ProofRules::Strict`], the bound for decoding one proved element
-/// (the merk decoder's own value cap).
-const STRICT_ELEMENT_DECODE_LIMIT: usize = grovedb_merk::proofs::encoding::MAX_VALUE_LEN as usize;
+/// Decodes `bytes` with GroveDB's bincode configuration under a claim limit
+/// proportional to their length, for [`ProofRules::Strict`].
+///
+/// grovedb 3.1.0 decodes proofs and elements with no limit, and bincode
+/// 2.0.0-rc.3 resizes a byte string to its claimed length (zeroing it) before
+/// reading it: a few bytes claiming an enormous length abort the process, and
+/// a fixed large limit still lets each few bytes force a large zeroed
+/// allocation. So the limit is the smallest power of two at least 32 times
+/// the input's length, and at least 1 KiB. bincode also claims
+/// `len * size_of::<T>()` for a container of `T` before reading it (72 bytes
+/// for a lower-layer map entry, which takes at least 3 serialized bytes; 24
+/// for a reference path segment, at least 1), so honest data claims up to
+/// about 25 times its length, which the factor of 32 covers; a lying length
+/// can make the decoder allocate at most about 64 times the input.
+fn decode_bounded<T: bincode::Decode>(
+    bytes: &[u8],
+) -> Result<(T, usize), bincode::error::DecodeError> {
+    let class = bytes
+        .len()
+        .saturating_mul(32)
+        .max(1 << 10)
+        .checked_next_power_of_two()
+        .ok_or(bincode::error::DecodeError::LimitExceeded)?;
+    decode_in_class(bytes, class)
+}
+
+macro_rules! decode_in_classes {
+    ($bytes:expr, $class:expr, $($bits:literal)*) => {
+        match $class {
+            $(
+                c if c == 1usize << $bits => bincode::decode_from_slice(
+                    $bytes,
+                    bincode::config::standard()
+                        .with_big_endian()
+                        .with_limit::<{ 1usize << $bits }>(),
+                ),
+            )*
+            _ => Err(bincode::error::DecodeError::LimitExceeded),
+        }
+    };
+}
+
+#[cfg(target_pointer_width = "64")]
+fn decode_in_class<T: bincode::Decode>(
+    bytes: &[u8],
+    class: usize,
+) -> Result<(T, usize), bincode::error::DecodeError> {
+    decode_in_classes!(bytes, class, 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33)
+}
+
+#[cfg(not(target_pointer_width = "64"))]
+fn decode_in_class<T: bincode::Decode>(
+    bytes: &[u8],
+    class: usize,
+) -> Result<(T, usize), bincode::error::DecodeError> {
+    decode_in_classes!(bytes, class, 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31)
+}
 
 impl GroveDb {
     /// Decodes a proof envelope. [`ProofRules::V310`] is 3.1.0's decode (no
-    /// size limit, trailing bytes ignored). [`ProofRules::Strict`] bounds what
-    /// the envelope may claim by [`STRICT_PROOF_DECODE_LIMIT`] and refuses
-    /// trailing bytes.
+    /// size limit, trailing bytes ignored). [`ProofRules::Strict`] refuses an
+    /// envelope over [`STRICT_MAX_PROOF_BYTES`], decodes with
+    /// [`decode_bounded`], and refuses trailing bytes.
     fn decode_proof_with_rules(proof: &[u8], rules: ProofRules) -> Result<GroveDBProof, Error> {
         let decode_error = |e| Error::CorruptedData(format!("unable to decode proof: {}", e));
         match rules {
@@ -52,11 +104,14 @@ impl GroveDb {
                     .0)
             }
             ProofRules::Strict => {
-                let config = bincode::config::standard()
-                    .with_big_endian()
-                    .with_limit::<STRICT_PROOF_DECODE_LIMIT>();
-                let (grovedb_proof, used) =
-                    bincode::decode_from_slice(proof, config).map_err(decode_error)?;
+                if proof.len() > STRICT_MAX_PROOF_BYTES {
+                    return Err(Error::CorruptedData(format!(
+                        "unable to decode proof: {} bytes; at most {} are verified",
+                        proof.len(),
+                        STRICT_MAX_PROOF_BYTES
+                    )));
+                }
+                let (grovedb_proof, used) = decode_bounded(proof).map_err(decode_error)?;
                 if used != proof.len() {
                     return Err(Error::CorruptedData(format!(
                         "unable to decode proof: {} trailing bytes after the encoded proof",
@@ -70,8 +125,8 @@ impl GroveDb {
 
     /// Decodes a proved element. [`ProofRules::V310`] is
     /// [`Element::deserialize`]; [`ProofRules::Strict`] is the same decode
-    /// bounded by [`STRICT_ELEMENT_DECODE_LIMIT`], so a node value that claims
-    /// an enormous length is refused instead of aborting the process.
+    /// through [`decode_bounded`], so a node value that claims a length it
+    /// doesn't carry is refused instead of allocating it.
     fn deserialize_element(
         bytes: &[u8],
         rules: ProofRules,
@@ -84,10 +139,7 @@ impl GroveDb {
                     "Element::deserialize",
                     grove_version.grovedb_versions.element.deserialize
                 );
-                let config = bincode::config::standard()
-                    .with_big_endian()
-                    .with_limit::<STRICT_ELEMENT_DECODE_LIMIT>();
-                Ok(bincode::decode_from_slice(bytes, config)
+                Ok(decode_bounded(bytes)
                     .map_err(|e| {
                         Error::CorruptedData(format!("unable to deserialize element {}", e))
                     })?
@@ -659,20 +711,48 @@ impl GroveDb {
     /// return `forged` at the honest root. It recomputes the hash rather than
     /// refusing items outright because the 3.1.0 prover sends a `SumItem`
     /// (and an item past the limit) as `KVValueHash`, with an honest hash.
+    ///
+    /// Likewise an empty tree (any tree element with no root key) is committed
+    /// as `combine_hash(value_hash(bytes), NULL_HASH)`, so its bytes must give
+    /// the supplied value hash that way; otherwise any key, an item's included,
+    /// could be presented as an empty tree (a forged absence, at the root the
+    /// proof claims). A tree element with a root key cannot be bound here: its
+    /// value hash combines its bytes with the subtree's root, which the proof
+    /// carries only as a lower layer (checked when present). A value that
+    /// doesn't decode as an element is refused.
     fn check_supplied_value_hash_strict(
         value: &[u8],
         supplied_value_hash: &CryptoHash,
         grove_version: &GroveVersion,
     ) -> Result<(), grovedb_merk::error::Error> {
-        match Self::deserialize_element(value, ProofRules::Strict, grove_version) {
-            Ok(Element::Item(..)) | Ok(Element::SumItem(..))
+        let refuse = |m: String| Err(grovedb_merk::error::Error::InvalidProofError(m));
+        let element = match Self::deserialize_element(value, ProofRules::Strict, grove_version) {
+            Ok(element) => element,
+            // Every value in a GroveDB merk tree is a serialized element.
+            Err(e) => return refuse(format!("KVValueHash node value is not an element: {e}")),
+        };
+        match element {
+            Element::Item(..) | Element::SumItem(..)
                 if value_hash(value).value() != supplied_value_hash =>
             {
-                Err(grovedb_merk::error::Error::InvalidProofError(
+                refuse(
                     "KVValueHash node carries an item element whose bytes do not hash to its \
                      value hash"
                         .to_string(),
-                ))
+                )
+            }
+            Element::Tree(None, _)
+            | Element::SumTree(None, ..)
+            | Element::BigSumTree(None, ..)
+            | Element::CountTree(None, ..)
+            | Element::CountSumTree(None, ..)
+                if &combine_hash(value_hash(value).value(), &NULL_HASH).unwrap()
+                    != supplied_value_hash =>
+            {
+                refuse(
+                    "KVValueHash node carries an empty tree element not bound to its value hash"
+                        .to_string(),
+                )
             }
             _ => Ok(()),
         }
@@ -685,7 +765,12 @@ impl GroveDb {
     ///    so a `Reference` here came in a `KVValueHash` node whose value hash
     ///    the verifier cannot check against its bytes (a forged reference
     ///    standing in for the real one).
-    /// 2. On the query's `path` (a layer above `query.path`, where the merk
+    /// 2. No tree element under the plain `value_hash` of its bytes (a `KV`
+    ///    node): every tree is committed under a combined hash, so such a row
+    ///    can only be a forgery that grinds the 63-byte `value_hash` /
+    ///    `combine_hash` ambiguity. (3.1.0's non-batch insert of an empty
+    ///    `CountSumTree` is the one exception, so strict refuses that element.)
+    /// 3. On the query's `path` (a layer above `query.path`, where the merk
     ///    query is the single next path segment), the element must be a tree:
     ///    - a non-tree element (`Item`, `SumItem`, `Reference`) is refused. It
     ///      would cut the descent short and, at the honest root, turn into a
@@ -697,8 +782,13 @@ impl GroveDb {
     ///      `combine_hash(value_hash(bytes), NULL_HASH)`; otherwise a prover
     ///      could present a non-empty subtree as an empty one.
     ///
-    /// Subquery positions (below `query.path`) are not covered by rule 2:
-    /// there, 3.1.0's honest prover returns non-tree elements as results.
+    /// Subquery positions (below `query.path`) are not covered by rule 3:
+    /// there, 3.1.0's honest prover returns non-tree elements as results. The
+    /// empty-tree binding holds at every position (it runs on every
+    /// `KVValueHash` node, see `check_supplied_value_hash_strict`). A tree
+    /// element with a root key returned as a result row, with no lower layer,
+    /// stays unbound at any position: 3.1.0's proof format doesn't carry the
+    /// subtree root its value hash combines.
     fn check_proved_element_strict(
         query: &PathQuery,
         current_path: &[&[u8]],
@@ -713,6 +803,15 @@ impl GroveDb {
                 query.clone(),
                 format!(
                     "Proof presents an unresolved reference element at key {}",
+                    hex::encode(key)
+                ),
+            ));
+        }
+        if element.is_any_tree() && value_hash_in_proof == value_hash(value_bytes).value() {
+            return Err(Error::InvalidProof(
+                query.clone(),
+                format!(
+                    "Proof presents a tree element at key {} under the plain hash of its bytes",
                     hex::encode(key)
                 ),
             ));
@@ -780,13 +879,21 @@ impl GroveDb {
     /// - decodes the large-value opcodes (values of 64 KiB or more);
     /// - refuses a child under a `Hash` node (its hash excludes children);
     /// - refuses a `KVValueHash` node carrying an `Item`/`SumItem` whose bytes
-    ///   do not hash to the node's value hash (the KV→KVValueHash forgery);
+    ///   do not hash to the node's value hash (the KV→KVValueHash forgery), an
+    ///   empty tree not bound to its value hash, or a value that isn't an
+    ///   element, wherever the node is;
+    /// - refuses a tree element proved under the plain hash of its bytes;
     /// - refuses an unresolved `Reference` element among the proved elements;
     /// - on `query.path`, refuses a non-tree element, a non-empty tree with no
     ///   lower layer, and an empty tree not bound to its value hash;
-    /// - decodes the envelope and each proved element with a size bound (where
-    ///   3.1.0, unbounded, aborts the process on a lying length) and refuses
-    ///   trailing bytes after the envelope.
+    /// - decodes the envelope and each element with a claim bound of about 32
+    ///   times its length (where 3.1.0, unbounded, aborts the process on a
+    ///   lying length), refuses an envelope over 256 MiB, and refuses trailing
+    ///   bytes after the envelope.
+    ///
+    /// Not bound, by either rule set: the bytes of a tree element with a root
+    /// key returned as a result with no lower layer (3.1.0's proof format
+    /// doesn't carry the subtree root its value hash combines).
     ///
     /// [`GroveDb::verify_query_v310`] reproduces 3.1.0 exactly.
     pub fn verify_query(
